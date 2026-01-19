@@ -138,6 +138,7 @@ function renderStory(story, index) {
     else if (titleLower.startsWith('ask hn')) badges += '<span class="badge badge-ask">Ask</span>';
     else if (titleLower.startsWith('tell hn')) badges += '<span class="badge badge-tell">Tell</span>';
 
+    if (story.hit_front_page) badges += `<span class="badge badge-frontpage" title="Hit front page${story.front_page_rank ? ' (#' + story.front_page_rank + ')' : ''}">#${story.front_page_rank || 'FP'}</span>`;
     if (story.is_read_later) badges += '<span class="badge badge-readlater">Later</span>';
     if (story.content_status === 'blocked') badges += '<span class="badge badge-blocked" title="Content blocked - check manually">Blocked</span>';
 
@@ -159,6 +160,7 @@ function renderStory(story, index) {
     }
 
     const classes = ['story'];
+    if (story.hit_front_page) classes.push('front-page');
     if (story.is_dismissed) classes.push('dismissed');
     if (story.is_read) classes.push('read');
 
@@ -732,6 +734,16 @@ function selectStory(index) {
     const visibleStories = getVisibleStoryElements();
     if (index < 0 || index >= visibleStories.length) return;
 
+    // Collapse previously selected story's content
+    if (selectedIndex >= 0 && selectedIndex < visibleStories.length) {
+        const prevEl = visibleStories[selectedIndex];
+        const prevContent = prevEl.querySelector('.story-content');
+        if (prevContent) {
+            prevContent.classList.remove('expanded');
+            prevContent.removeAttribute('tabindex');
+        }
+    }
+
     selectedIndex = index;
 
     // Update visual selection
@@ -743,6 +755,12 @@ function selectStory(index) {
     const selected = visibleStories[index];
     if (selected) {
         selected.scrollIntoView({ behavior: 'instant', block: 'nearest' });
+
+        // Auto-expand content for selected story
+        const storyId = parseInt(selected.dataset.id);
+        if (storyId) {
+            expandContent(storyId);
+        }
     }
 }
 

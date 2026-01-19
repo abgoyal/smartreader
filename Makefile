@@ -22,7 +22,7 @@ run-public:
 # Build release archive (for GitHub releases)
 release: ui.zip
 	mkdir -p _release
-	cp hn_new.py ui.zip .env.example README.md Caddyfile hn-new.service _release/
+	cp hn_new.py fetch_content.py ui.zip .env.example README.md Caddyfile hn-new.service _release/
 	cd _release && zip -r ../hn-new-release.zip .
 	rm -rf _release
 	@echo "Created hn-new-release.zip"
@@ -44,13 +44,13 @@ clean:
 
 # Lint Python code (check only)
 lint:
-	uvx ruff check hn_new.py
+	uvx ruff check hn_new.py fetch_content.py
 
 # Format Python code
 format:
-	uvx ruff format hn_new.py
-	uvx ruff check --fix hn_new.py
+	uvx ruff format hn_new.py fetch_content.py
+	uvx ruff check --fix hn_new.py fetch_content.py
 
 # Run all checks (for CI)
 check: lint
-	uvx ruff format --check hn_new.py
+	uvx ruff format --check hn_new.py fetch_content.py

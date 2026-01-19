@@ -21,10 +21,10 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Lint Python
-        run: uvx ruff check hn_new.py
+        run: uvx ruff check hn_new.py fetch_content.py
 
       - name: Check Python formatting
-        run: uvx ruff format --check hn_new.py
+        run: uvx ruff format --check hn_new.py fetch_content.py
 
       - name: Verify Python syntax
-        run: python3 -m py_compile hn_new.py
+        run: python3 -m py_compile hn_new.py fetch_content.py

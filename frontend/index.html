@@ -16,128 +16,138 @@
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
-    <header>
-        <div class="header-top">
-            <h1>HN New</h1>
-            <button id="theme-toggle" onclick="toggleTheme()" title="Toggle dark/light mode">
-                <span class="theme-icon-light">&#9790;</span>
-                <span class="theme-icon-dark">&#9788;</span>
-            </button>
-        </div>
-        <div id="status-bar">
-            <span id="story-count">0 stories</span>
-            <span class="sep">|</span>
-            <span id="content-status">Content: --</span>
-            <span class="sep">|</span>
-            <span id="filter-status">Showing all</span>
-        </div>
-        <nav id="view-tabs">
-            <button class="tab active" data-view="all">All</button>
-            <button class="tab" data-view="readlater">Read Later</button>
-            <button class="tab" data-view="settings">Settings</button>
-        </nav>
-    </header>
-
-    <main>
-        <!-- Stories View -->
-        <section id="view-all" class="view active">
-            <div id="controls">
-                <label>
-                    <input type="checkbox" id="show-dismissed"> Show dismissed
-                </label>
-                <label>
-                    <input type="checkbox" id="show-blocked"> Show blocked
-                </label>
-                <label>
-                    <input type="checkbox" id="sort-oldest" checked> Oldest first
-                </label>
-                <span class="kbd-hint" title="Press ? for all shortcuts">j↑ k↓ nav · o open · d dismiss · ? help</span>
-                <button id="btn-refresh" title="Fetch new stories (F)">Refresh</button>
-            </div>
-            <ul id="story-list"></ul>
-        </section>
-
-        <!-- Read Later View -->
-        <section id="view-readlater" class="view">
-            <ul id="readlater-list"></ul>
-            <p id="readlater-empty" class="empty-msg">No stories saved for later</p>
-        </section>
-
-        <!-- Settings View -->
-        <section id="view-settings" class="view">
-            <div class="settings-grid">
-                <div class="settings-section">
-                    <h3>Blocked Domains</h3>
-                    <p class="hint">Stories from these domains are hidden</p>
-                    <div class="tag-list" id="blocked-domains"></div>
-                    <div class="add-form">
-                        <input type="text" id="add-blocked-domain" placeholder="domain.com">
-                        <button onclick="addBlockedDomain()">Add</button>
-                    </div>
-                </div>
-
-                <div class="settings-section">
-                    <h3>Blocked Words</h3>
-                    <p class="hint">Stories with these words in title are hidden</p>
-                    <div class="tag-list" id="blocked-words"></div>
-                    <div class="add-form">
-                        <input type="text" id="add-blocked-word" placeholder="word">
-                        <button onclick="addBlockedWord()">Add</button>
-                    </div>
-                </div>
-
-                <div class="settings-section">
-                    <h3>Merit Words</h3>
-                    <p class="hint">Boost stories containing these words</p>
-                    <div class="tag-list" id="merit-words"></div>
-                    <div class="add-form">
-                        <input type="text" id="add-merit-word" placeholder="word">
-                        <button onclick="addMeritWord()">Add</button>
-                    </div>
-                </div>
-
-                <div class="settings-section">
-                    <h3>Demerit Words</h3>
-                    <p class="hint">Penalize stories containing these words</p>
-                    <div class="tag-list" id="demerit-words"></div>
-                    <div class="add-form">
-                        <input type="text" id="add-demerit-word" placeholder="word">
-                        <button onclick="addDemeritWord()">Add</button>
-                    </div>
-                </div>
-
-                <div class="settings-section">
-                    <h3>Merit Domains</h3>
-                    <p class="hint">Boost stories from these domains</p>
-                    <div class="tag-list" id="merit-domains"></div>
-                    <div class="add-form">
-                        <input type="text" id="add-merit-domain" placeholder="domain.com">
-                        <button onclick="addMeritDomain()">Add</button>
-                    </div>
-                </div>
-
-                <div class="settings-section">
-                    <h3>Demerit Domains</h3>
-                    <p class="hint">Penalize stories from these domains</p>
-                    <div class="tag-list" id="demerit-domains"></div>
-                    <div class="add-form">
-                        <input type="text" id="add-demerit-domain" placeholder="domain.com">
-                        <button onclick="addDemeritDomain()">Add</button>
-                    </div>
-                </div>
+    <div class="app-layout">
+        <!-- Left Sidebar (was header) -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h1>HN New</h1>
+                <button id="theme-toggle" onclick="toggleTheme()" title="Toggle dark/light mode">
+                    <span class="theme-icon-light">&#9790;</span>
+                    <span class="theme-icon-dark">&#9788;</span>
+                </button>
             </div>
 
-            <div class="settings-section" style="margin-top: 20px;">
-                <h3>Cloudflare Browser Rendering Usage</h3>
-                <div id="usage-stats">Loading...</div>
+            <nav id="view-tabs">
+                <button class="tab active" data-view="all">All</button>
+                <button class="tab" data-view="readlater">Read Later</button>
+                <button class="tab" data-view="settings">Settings</button>
+            </nav>
+
+            <div id="status-bar">
+                <div id="story-count">0 stories</div>
+                <div id="content-status">Content: --</div>
+                <div id="filter-status">Showing all</div>
             </div>
 
-            <div class="settings-section" style="margin-top: 20px;">
-                <h3>Actions</h3>
-                <button onclick="clearDismissed()">Clear all dismissed stories</button>
+            <div class="sidebar-shortcuts">
+                <kbd>j</kbd>/<kbd>k</kbd> nav
+                <kbd>o</kbd> open
+                <kbd>e</kbd> expand
+                <kbd>?</kbd> help
             </div>
-        </section>
-    </main>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main>
+            <!-- Stories View -->
+            <section id="view-all" class="view active">
+                <div id="controls">
+                    <label>
+                        <input type="checkbox" id="show-dismissed"> Show dismissed
+                    </label>
+                    <label>
+                        <input type="checkbox" id="show-blocked"> Show blocked
+                    </label>
+                    <label>
+                        <input type="checkbox" id="sort-oldest" checked> Oldest first
+                    </label>
+                    <button id="btn-refresh" title="Fetch new stories (F)">Refresh</button>
+                </div>
+                <ul id="story-list"></ul>
+            </section>
+
+            <!-- Read Later View -->
+            <section id="view-readlater" class="view">
+                <ul id="readlater-list"></ul>
+                <p id="readlater-empty" class="empty-msg">No stories saved for later</p>
+            </section>
+
+            <!-- Settings View -->
+            <section id="view-settings" class="view">
+                <div class="settings-grid">
+                    <div class="settings-section">
+                        <h3>Blocked Domains</h3>
+                        <p class="hint">Stories from these domains are hidden</p>
+                        <div class="tag-list" id="blocked-domains"></div>
+                        <div class="add-form">
+                            <input type="text" id="add-blocked-domain" placeholder="domain.com">
+                            <button onclick="addBlockedDomain()">Add</button>
+                        </div>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>Blocked Words</h3>
+                        <p class="hint">Stories with these words in title are hidden</p>
+                        <div class="tag-list" id="blocked-words"></div>
+                        <div class="add-form">
+                            <input type="text" id="add-blocked-word" placeholder="word">
+                            <button onclick="addBlockedWord()">Add</button>
+                        </div>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>Merit Words</h3>
+                        <p class="hint">Boost stories containing these words</p>
+                        <div class="tag-list" id="merit-words"></div>
+                        <div class="add-form">
+                            <input type="text" id="add-merit-word" placeholder="word">
+                            <button onclick="addMeritWord()">Add</button>
+                        </div>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>Demerit Words</h3>
+                        <p class="hint">Penalize stories containing these words</p>
+                        <div class="tag-list" id="demerit-words"></div>
+                        <div class="add-form">
+                            <input type="text" id="add-demerit-word" placeholder="word">
+                            <button onclick="addDemeritWord()">Add</button>
+                        </div>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>Merit Domains</h3>
+                        <p class="hint">Boost stories from these domains</p>
+                        <div class="tag-list" id="merit-domains"></div>
+                        <div class="add-form">
+                            <input type="text" id="add-merit-domain" placeholder="domain.com">
+                            <button onclick="addMeritDomain()">Add</button>
+                        </div>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>Demerit Domains</h3>
+                        <p class="hint">Penalize stories from these domains</p>
+                        <div class="tag-list" id="demerit-domains"></div>
+                        <div class="add-form">
+                            <input type="text" id="add-demerit-domain" placeholder="domain.com">
+                            <button onclick="addDemeritDomain()">Add</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="settings-section" style="margin-top: 20px;">
+                    <h3>Cloudflare Browser Rendering Usage</h3>
+                    <div id="usage-stats">Loading...</div>
+                </div>
+
+                <div class="settings-section" style="margin-top: 20px;">
+                    <h3>Actions</h3>
+                    <button onclick="clearDismissed()">Clear all dismissed stories</button>
+                </div>
+            </section>
+        </main>
+    </div>
 
     <!-- Content Modal -->
     <div id="content-modal" class="modal">

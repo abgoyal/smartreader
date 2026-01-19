@@ -8,12 +8,15 @@ Fetches new stories on a schedule, extracts article content via Cloudflare Brows
 
 - **Story fetching**: Pulls from HN Algolia API with Firebase/ID-walking fallbacks
 - **Content extraction**: Cloudflare Browser Rendering API (returns markdown)
+- **Front page tracking**: Monitors HN front page and highlights stories that make it
+- **Self-post support**: Ask HN, Tell HN, and other text posts display inline
 - **Scheduled fetching**: Hourly by default, configurable
-- **Keyboard navigation**: vim-style (j/k) plus shortcuts for all actions
+- **Keyboard navigation**: vim-style (j/k) with auto-expanding content
 - **Filtering**: Block domains/words, merit/demerit scoring
 - **Read later**: Save stories for later reading
 - **Usage tracking**: Monitor Cloudflare API usage for billing
 - **Quota handling**: Pauses extraction when daily free tier limit is reached
+- **Sidebar layout**: Compact header in left sidebar to maximize reading space
 
 ## Quick Start
 
@@ -207,9 +210,10 @@ This triggers the workflow which builds and publishes:
 ### Background Tasks
 
 1. **Story Fetcher**: Runs on startup + hourly, fetches new stories from HN
-2. **Content Worker**: Single worker extracts article content via Cloudflare (rate-limited)
+2. **Content Workers**: Multiple workers extract article content via Cloudflare (rate-limited per domain)
+3. **Front Page Tracker**: Polls HN front page every 5 minutes to track which stories make it
 
-Both run independently; server is always ready to serve requests.
+All tasks run independently; server is always ready to serve requests.
 
 ### Free Tier Quota
 
@@ -218,3 +222,21 @@ The Cloudflare free tier has a 10-minute daily browser time limit. When exceeded
 - UI shows quota status in the Settings view
 - Story fetching continues (only content extraction pauses)
 
+## Utilities
+
+### fetch_content.py
+
+Standalone CLI tool for extracting article content as markdown with local images. Useful for saving articles for offline reading.
+
+```bash
+# Basic usage
+./fetch_content.py https://example.com/article
+
+# Custom output directory
+./fetch_content.py https://example.com/article --output ./my-article
+
+# Skip image downloads
+./fetch_content.py https://example.com/article --no-images
+```
+
+Output is saved to `fetched/<date>-<slug>/index.md` with images downloaded locally.

@@ -3,6 +3,7 @@
 
 # Data directory
 .hn_data/
+fetched/
 
 # Build artifacts
 ui.zip

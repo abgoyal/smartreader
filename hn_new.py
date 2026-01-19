@@ -34,11 +34,11 @@ Environment variables (see .env.example):
 import argparse
 import asyncio
 import base64
+import logging
 import os
 import re
 import secrets
 import sqlite3
-import sys
 import tempfile
 import threading
 import time
@@ -58,6 +58,14 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
+# Set up logging with timestamps
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("hn_new")
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -69,7 +77,11 @@ FRONTEND_ZIP = Path(__file__).parent / "ui.zip"  # Alternative: serve from zip
 
 HN_API_BASE = "https://hacker-news.firebaseio.com/v0"
 HN_NEW_STORIES = f"{HN_API_BASE}/newstories.json"
+HN_TOP_STORIES = f"{HN_API_BASE}/topstories.json"
 HN_ITEM = f"{HN_API_BASE}/item/{{id}}.json"
+
+# Front page tracking
+FRONT_PAGE_POLL_INTERVAL = 5 * 60  # Check every 5 minutes
 
 TEASER_LENGTH = 300  # characters for teaser
 
@@ -123,6 +135,8 @@ CREATE TABLE IF NOT EXISTS stories (
     content_attempts INTEGER DEFAULT 0,  -- number of fetch attempts (for retry limiting)
     content_source TEXT,  -- 'cloudflare'
     browser_ms REAL DEFAULT 0,  -- Cloudflare billing: browser milliseconds used
+    hit_front_page INTEGER DEFAULT 0,  -- 1 if story appeared in topstories
+    front_page_rank INTEGER,  -- highest rank achieved on front page (1-30)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -231,7 +245,19 @@ class Database:
     def init(self):
         conn = self._get_conn()
         conn.executescript(SCHEMA)
+        # Migrations for existing databases
+        self._migrate_add_front_page_columns()
         conn.commit()
+
+    def _migrate_add_front_page_columns(self):
+        """Add hit_front_page and front_page_rank columns if they don't exist."""
+        try:
+            self.execute("SELECT hit_front_page FROM stories LIMIT 1")
+        except sqlite3.OperationalError:
+            self.execute(
+                "ALTER TABLE stories ADD COLUMN hit_front_page INTEGER DEFAULT 0"
+            )
+            self.execute("ALTER TABLE stories ADD COLUMN front_page_rank INTEGER")
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         return self._get_conn().execute(sql, params)
@@ -251,26 +277,56 @@ class Database:
     # --- Story operations ---
 
     def upsert_story(self, story: dict):
-        self.execute(
-            """
-            INSERT INTO stories (id, title, url, domain, by, time, score, descendants)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                score = excluded.score,
-                descendants = excluded.descendants,
-                updated_at = CURRENT_TIMESTAMP
-        """,
-            (
-                story["id"],
-                story["title"],
-                story.get("url"),
-                story.get("domain"),
-                story.get("by"),
-                story.get("time"),
-                story.get("score", 0),
-                story.get("descendants", 0),
-            ),
-        )
+        url = story.get("url")
+        hn_text = story.get("text")  # Self-post text from HN API
+
+        # For stories without URL but with text (Ask HN, etc.), use the text as content
+        if not url and hn_text:
+            self.execute(
+                """
+                INSERT INTO stories (id, title, url, domain, by, time, score, descendants, content, content_status, content_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', 'hn_text')
+                ON CONFLICT(id) DO UPDATE SET
+                    score = excluded.score,
+                    descendants = excluded.descendants,
+                    content = COALESCE(stories.content, excluded.content),
+                    content_status = CASE WHEN stories.content IS NULL THEN 'done' ELSE stories.content_status END,
+                    content_source = CASE WHEN stories.content IS NULL THEN 'hn_text' ELSE stories.content_source END,
+                    updated_at = CURRENT_TIMESTAMP
+            """,
+                (
+                    story["id"],
+                    story["title"],
+                    url,
+                    story.get("domain"),
+                    story.get("by"),
+                    story.get("time"),
+                    story.get("score", 0),
+                    story.get("descendants", 0),
+                    hn_text,
+                ),
+            )
+        else:
+            self.execute(
+                """
+                INSERT INTO stories (id, title, url, domain, by, time, score, descendants)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    score = excluded.score,
+                    descendants = excluded.descendants,
+                    updated_at = CURRENT_TIMESTAMP
+            """,
+                (
+                    story["id"],
+                    story["title"],
+                    url,
+                    story.get("domain"),
+                    story.get("by"),
+                    story.get("time"),
+                    story.get("score", 0),
+                    story.get("descendants", 0),
+                ),
+            )
 
     def get_stories(
         self, include_dismissed: bool = False, include_blocked: bool = False
@@ -444,6 +500,88 @@ class Database:
             (story_id,),
         )
         self.commit()
+
+    def get_content_queue_diagnostic(self) -> dict:
+        """Get detailed diagnostic info about the content queue."""
+        row = self.fetchone("""
+            SELECT
+                SUM(CASE WHEN content_status = 'pending' AND content_attempts = 0 THEN 1 ELSE 0 END) as pending_fresh,
+                SUM(CASE WHEN content_status = 'pending' AND content_attempts > 0 THEN 1 ELSE 0 END) as pending_with_attempts,
+                SUM(CASE WHEN content_status = 'retry' THEN 1 ELSE 0 END) as retry,
+                SUM(CASE WHEN content_status = 'fetching' THEN 1 ELSE 0 END) as fetching,
+                SUM(CASE WHEN content_status = 'done' THEN 1 ELSE 0 END) as done,
+                SUM(CASE WHEN content_status = 'failed' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN content_status = 'blocked' THEN 1 ELSE 0 END) as blocked,
+                SUM(CASE WHEN content_status = 'skipped' THEN 1 ELSE 0 END) as skipped,
+                SUM(CASE WHEN url IS NULL THEN 1 ELSE 0 END) as no_url,
+                SUM(CASE WHEN content_attempts >= 3 AND content_status NOT IN ('done', 'failed', 'blocked', 'skipped') THEN 1 ELSE 0 END) as exhausted_not_failed
+            FROM stories
+        """)
+        return dict(row) if row else {}
+
+    def cleanup_stuck_content_jobs(self, max_attempts: int = 3) -> int:
+        """
+        Reset stuck 'fetching' jobs and mark exhausted retries as failed.
+        Called on startup and periodically to recover from crashes.
+        Returns number of jobs reset.
+        """
+        # First, log diagnostic info
+        diag = self.get_content_queue_diagnostic()
+        if (
+            diag.get("fetching", 0) > 0
+            or diag.get("exhausted_not_failed", 0) > 0
+            or diag.get("no_url", 0) > 0
+        ):
+            log.info(f"Queue diagnostic: {diag}")
+
+        total_fixed = 0
+
+        # Mark stories without URLs as 'skipped' (Ask HN, Tell HN, etc.)
+        cursor = self.execute(
+            """
+            UPDATE stories
+            SET content_status = 'skipped', updated_at = CURRENT_TIMESTAMP
+            WHERE url IS NULL
+              AND content_status NOT IN ('done', 'failed', 'blocked', 'skipped')
+        """
+        )
+        skipped_count = cursor.rowcount
+        total_fixed += skipped_count
+
+        # Reset stuck 'fetching' jobs back to 'retry'
+        cursor = self.execute(
+            """
+            UPDATE stories
+            SET content_status = 'retry', updated_at = CURRENT_TIMESTAMP
+            WHERE content_status = 'fetching'
+              AND content_attempts < ?
+        """,
+            (max_attempts,),
+        )
+        reset_count = cursor.rowcount
+        total_fixed += reset_count
+
+        # Mark exhausted retries as 'failed' (any status except terminal ones)
+        cursor = self.execute(
+            """
+            UPDATE stories
+            SET content_status = 'failed', updated_at = CURRENT_TIMESTAMP
+            WHERE content_status NOT IN ('done', 'failed', 'blocked', 'skipped')
+              AND content_attempts >= ?
+        """,
+            (max_attempts,),
+        )
+        failed_count = cursor.rowcount
+        total_fixed += failed_count
+
+        self.commit()
+
+        if total_fixed > 0:
+            log.info(
+                f"Content queue cleanup: {skipped_count} skipped (no URL), {reset_count} reset to retry, {failed_count} marked failed"
+            )
+
+        return total_fixed
 
     def get_content_queue_stats(self) -> dict:
         """Get stats about the content fetch queue."""
@@ -703,8 +841,9 @@ class Database:
     def get_stats(self) -> dict:
         return {
             "total_stories": self.fetchone("SELECT COUNT(*) as c FROM stories")["c"],
+            # pending_content includes 'pending', 'retry', and 'fetching' - all work remaining
             "pending_content": self.fetchone(
-                "SELECT COUNT(*) as c FROM stories WHERE content_status = 'pending'"
+                "SELECT COUNT(*) as c FROM stories WHERE content_status IN ('pending', 'retry', 'fetching')"
             )["c"],
             "fetching_content": self.fetchone(
                 "SELECT COUNT(*) as c FROM stories WHERE content_status = 'fetching'"
@@ -726,7 +865,43 @@ class Database:
             ],
             "read_later": self.fetchone("SELECT COUNT(*) as c FROM read_later")["c"],
             "dismissed": self.fetchone("SELECT COUNT(*) as c FROM dismissed")["c"],
+            "front_page_stories": self.fetchone(
+                "SELECT COUNT(*) as c FROM stories WHERE hit_front_page = 1"
+            )["c"],
         }
+
+    # --- Front Page Tracking ---
+
+    def update_front_page_stories(self, top_story_ids: list[int]) -> int:
+        """
+        Mark stories that appear in topstories as hitting the front page.
+        Updates front_page_rank to the best (lowest) rank achieved.
+        Returns number of stories updated.
+        """
+        if not top_story_ids:
+            return 0
+
+        updated = 0
+        for rank, story_id in enumerate(
+            top_story_ids[:30], start=1
+        ):  # Top 30 = front page
+            cursor = self.execute(
+                """
+                UPDATE stories
+                SET hit_front_page = 1,
+                    front_page_rank = CASE
+                        WHEN front_page_rank IS NULL THEN ?
+                        WHEN ? < front_page_rank THEN ?
+                        ELSE front_page_rank
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND (hit_front_page = 0 OR front_page_rank IS NULL OR front_page_rank > ?)
+            """,
+                (rank, rank, rank, story_id, rank),
+            )
+            updated += cursor.rowcount
+        self.commit()
+        return updated
 
 
 # =============================================================================
@@ -755,6 +930,7 @@ def parse_algolia_story(hit: dict) -> Optional[dict]:
         "id": int(hit["objectID"]),
         "title": hit.get("title") or "[no title]",
         "url": hit.get("url"),
+        "text": hit.get("story_text"),  # Self-post text (Ask HN, etc.)
         "domain": extract_domain(hit.get("url")),
         "by": hit.get("author") or "[deleted]",
         "time": hit.get("created_at_i", 0),
@@ -816,7 +992,7 @@ async def fetch_via_algolia(
                 await asyncio.sleep(0.1)  # Be nice to Algolia
 
             except Exception as e:
-                print(f"Algolia API error: {e}", file=sys.stderr)
+                log.error(f"Algolia API error: {e}")
                 if page == 0 and not all_stories:
                     return [], False  # Complete failure on first request
                 break  # Partial success, continue with what we have
@@ -825,8 +1001,8 @@ async def fetch_via_algolia(
             break  # No more stories to fetch
 
         all_stories.extend(batch_stories)
-        print(
-            f"  Algolia batch: {len(batch_stories)} stories (total: {len(all_stories)})"
+        log.info(
+            f"Algolia batch: {len(batch_stories)} stories (total: {len(all_stories)})"
         )
 
         # Check if we've reached the time boundary
@@ -852,7 +1028,7 @@ async def fetch_via_firebase(client: httpx.AsyncClient) -> list[int]:
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        print(f"Firebase API error: {e}", file=sys.stderr)
+        log.error(f"Firebase API error: {e}")
         return []
 
 
@@ -868,6 +1044,7 @@ async def fetch_story_by_id(client: httpx.AsyncClient, story_id: int) -> Optiona
             "id": data["id"],
             "title": data.get("title", "[no title]"),
             "url": data.get("url"),
+            "text": data.get("text"),  # Self-post text (Ask HN, etc.)
             "domain": extract_domain(data.get("url")),
             "by": data.get("by", "[deleted]"),
             "time": data.get("time", 0),
@@ -896,14 +1073,14 @@ async def fetch_via_firebase_newstories(
     if not story_ids:
         return [], 0
 
-    print(f"  Firebase: fetching from {len(story_ids)} story IDs...")
+    log.info(f"Firebase: fetching from {len(story_ids)} story IDs...")
 
     for i, sid in enumerate(story_ids):
         max_id_seen = max(max_id_seen, sid)
 
         # Stop if we've reached checkpoint ID
         if since_id and sid <= since_id:
-            print(f"  Firebase: reached checkpoint ID {since_id}")
+            log.info(f"Firebase: reached checkpoint ID {since_id}")
             break
 
         story = await fetch_story_by_id(client, sid)
@@ -912,12 +1089,12 @@ async def fetch_via_firebase_newstories(
                 stories.append(story)
             elif story["time"] <= since_time:
                 # Reached time boundary
-                print("  Firebase: reached time boundary")
+                log.info("Firebase: reached time boundary")
                 break
 
         await asyncio.sleep(0.05)
 
-    print(f"  Firebase: fetched {len(stories)} stories")
+    log.info(f"Firebase: fetched {len(stories)} stories")
     return stories, max_id_seen
 
 
@@ -937,11 +1114,11 @@ async def fetch_via_id_walk(
     consecutive_failures = 0
     max_consecutive_failures = 100  # Stop if we hit too many non-stories in a row
 
-    print(f"  ID walk: starting from {start_id}...")
+    log.info(f"ID walk: starting from {start_id}...")
 
     while consecutive_failures < max_consecutive_failures:
         if since_id and current_id <= since_id:
-            print(f"  ID walk: reached checkpoint ID {since_id}")
+            log.info(f"ID walk: reached checkpoint ID {since_id}")
             break
 
         story = await fetch_story_by_id(client, current_id)
@@ -951,10 +1128,10 @@ async def fetch_via_id_walk(
             if story["time"] > since_time:
                 stories.append(story)
                 if len(stories) % 50 == 0:
-                    print(f"  ID walk: {len(stories)} stories so far...")
+                    log.info(f"ID walk: {len(stories)} stories so far...")
             elif story["time"] <= since_time:
                 # We've gone past our time window
-                print(f"  ID walk: reached time boundary at ID {current_id}")
+                log.info(f"ID walk: reached time boundary at ID {current_id}")
                 break
         else:
             consecutive_failures += 1
@@ -963,11 +1140,11 @@ async def fetch_via_id_walk(
         await asyncio.sleep(ID_WALK_DELAY)  # Rate limiting
 
     if consecutive_failures >= max_consecutive_failures:
-        print(
-            f"  ID walk: stopped after {max_consecutive_failures} consecutive non-stories"
+        log.info(
+            f"ID walk: stopped after {max_consecutive_failures} consecutive non-stories"
         )
 
-    print(f"  ID walk: fetched {len(stories)} stories")
+    log.info(f"ID walk: fetched {len(stories)} stories")
     return stories
 
 
@@ -988,20 +1165,20 @@ async def fetch_new_stories(
     checkpoint_time = db.get_newest_story_time()
     if checkpoint_time:
         since_time = checkpoint_time
-        print(f"Resuming from checkpoint: {checkpoint_time}")
+        log.info(f"Resuming from checkpoint: {checkpoint_time}")
     else:
         since_time = now - (lookback_hours * 3600)
-        print(f"No stories found, looking back {lookback_hours} hours")
+        log.info(f"No stories found, looking back {lookback_hours} hours")
 
     if since_time >= now:
-        print("Already up to date")
+        log.info("Already up to date")
         return 0
 
     total_fetched = 0
 
     async with httpx.AsyncClient() as client:
         # Primary: Algolia (fetches oldest to newest via time windows)
-        print(f"Fetching stories from {since_time} to {now}...")
+        log.info(f"Fetching stories from {since_time} to {now}...")
         algolia_stories, algolia_ok = await fetch_via_algolia(client, since_time)
 
         if algolia_stories:
@@ -1012,13 +1189,13 @@ async def fetch_new_stories(
             db.commit()
             total_fetched += len(algolia_stories)
             newest_time = max(s["time"] for s in algolia_stories)
-            print(
+            log.info(
                 f"Algolia: inserted {len(algolia_stories)} stories, newest at {newest_time}"
             )
 
         # If Algolia failed, try Firebase for recent stories
         if not algolia_ok:
-            print("Algolia failed, trying Firebase...")
+            log.warning("Algolia failed, trying Firebase...")
             firebase_stories, _ = await fetch_via_firebase_newstories(
                 client, since_time, since_id=None
             )
@@ -1028,9 +1205,9 @@ async def fetch_new_stories(
                     db.upsert_story(story)
                 db.commit()
                 total_fetched += len(firebase_stories)
-                print(f"Firebase: inserted {len(firebase_stories)} stories")
+                log.info(f"Firebase: inserted {len(firebase_stories)} stories")
 
-    print(f"Total: {total_fetched} stories fetched")
+    log.info(f"Total: {total_fetched} stories fetched")
     return total_fetched
 
 
@@ -1166,8 +1343,8 @@ async def fetch_content_cloudflare(url: str) -> FetchResult:
                     error_msg = str(errors)
                     if "time limit exceeded for today" in error_msg.lower():
                         cf_quota_exceeded_until = get_next_utc_midnight()
-                        print(
-                            "  [cloudflare] Daily quota exceeded, pausing until UTC midnight"
+                        log.warning(
+                            "Cloudflare daily quota exceeded, pausing until UTC midnight"
                         )
                         return FetchResult(
                             None,
@@ -1231,7 +1408,9 @@ async def content_worker(worker_id: int, db: Database, stop_event: asyncio.Event
     shared rate limit state to coordinate.
     """
     global cf_rate_limit_until
-    print(f"  [worker-{worker_id}] started")
+    log.info(f"[worker-{worker_id}] started")
+
+    idle_iterations = 0  # Track consecutive idle loops for periodic cleanup
 
     while not stop_event.is_set():
         # Check global CF rate limit (shared across all workers)
@@ -1239,8 +1418,8 @@ async def content_worker(worker_id: int, db: Database, stop_event: asyncio.Event
         now = time.time()
         if cf_rate_limit_until > now:
             wait_time = cf_rate_limit_until - now
-            print(
-                f"  [worker-{worker_id}] CF rate limited, waiting {wait_time:.0f}s..."
+            log.info(
+                f"[worker-{worker_id}] CF rate limited, waiting {wait_time:.0f}s..."
             )
             await asyncio.sleep(min(wait_time, 30))
             continue
@@ -1253,126 +1432,146 @@ async def content_worker(worker_id: int, db: Database, stop_event: asyncio.Event
         # Atomically claim next job (safe for multiple workers)
         job = db.claim_next_content_job(max_attempts=MAX_RETRIES)
         if not job:
+            idle_iterations += 1
+            # Periodic cleanup when idle (only worker 1 does this to avoid duplicates)
+            if worker_id == 1 and idle_iterations >= 12:  # ~60 seconds of idle
+                idle_iterations = 0
+                db.cleanup_stuck_content_jobs(max_attempts=MAX_RETRIES)
             await asyncio.sleep(5)  # No work, wait before checking again
             continue
 
+        idle_iterations = 0  # Reset on work found
         story_id = job["id"]
         url = job["url"]
         domain = job.get("domain") or extract_domain(url)
         attempts = job["content_attempts"]
 
-        # Check cache first (avoid fetching same URL twice)
-        cached = db.get_cached_content(url)
-        if cached:
-            db.complete_content_job(
-                story_id,
-                cached["content"],
-                "done",
-                cached["source"],
-                cached["browser_ms"],
-            )
-            print(f"  [worker-{worker_id}] cached {story_id} ({domain})")
-            continue
-
-        # Wait for domain rate limit (shared across all workers)
-        # This ensures we don't hammer the same domain from multiple workers
-        await wait_for_domain_rate_limit(domain)
-
-        # Fetch content
-        result = await fetch_content(url)
-
-        if result.status == "done":
-            db.cache_content(url, result.content, result.source, result.browser_ms)
-            db.complete_content_job(
-                story_id, result.content, "done", result.source, result.browser_ms
-            )
-            db.log_usage(story_id, url, result.browser_ms, result.source)
-            print(
-                f"  [worker-{worker_id}] done {story_id} ({domain}) [{result.browser_ms:.0f}ms]"
-            )
-
-        elif result.status == "blocked":
-            if attempts >= MAX_RETRIES:
+        try:
+            # Check cache first (avoid fetching same URL twice)
+            cached = db.get_cached_content(url)
+            if cached:
                 db.complete_content_job(
                     story_id,
-                    result.content or "",
-                    "blocked",
-                    result.source,
-                    result.browser_ms,
+                    cached["content"],
+                    "done",
+                    cached["source"],
+                    cached["browser_ms"],
                 )
-                if result.browser_ms > 0:
-                    db.log_usage(story_id, url, result.browser_ms, result.source)
-                print(
-                    f"  [worker-{worker_id}] BLOCKED {story_id} ({domain}) after {attempts} attempts"
+                log.info(f"[worker-{worker_id}] cached {story_id} ({domain})")
+                continue
+
+            # Wait for domain rate limit (shared across all workers)
+            # This ensures we don't hammer the same domain from multiple workers
+            await wait_for_domain_rate_limit(domain)
+
+            # Fetch content
+            result = await fetch_content(url)
+
+            if result.status == "done":
+                db.cache_content(url, result.content, result.source, result.browser_ms)
+                db.complete_content_job(
+                    story_id, result.content, "done", result.source, result.browser_ms
                 )
-            else:
+                db.log_usage(story_id, url, result.browser_ms, result.source)
+                log.info(
+                    f"[worker-{worker_id}] done {story_id} ({domain}) [{result.browser_ms:.0f}ms]"
+                )
+
+            elif result.status == "blocked":
+                if attempts >= MAX_RETRIES:
+                    db.complete_content_job(
+                        story_id,
+                        result.content or "",
+                        "blocked",
+                        result.source,
+                        result.browser_ms,
+                    )
+                    if result.browser_ms > 0:
+                        db.log_usage(story_id, url, result.browser_ms, result.source)
+                    log.warning(
+                        f"[worker-{worker_id}] BLOCKED {story_id} ({domain}) after {attempts} attempts"
+                    )
+                else:
+                    db.retry_content_job(story_id)
+                    log.info(
+                        f"[worker-{worker_id}] blocked {story_id} ({domain}), attempt {attempts}/{MAX_RETRIES}"
+                    )
+
+            elif result.status == "timeout":
+                if attempts >= MAX_RETRIES:
+                    db.complete_content_job(story_id, "", "failed", result.source)
+                    log.warning(
+                        f"[worker-{worker_id}] FAILED {story_id} ({domain}) - timeouts after {attempts} attempts"
+                    )
+                else:
+                    db.retry_content_job(story_id)
+                    log.info(
+                        f"[worker-{worker_id}] timeout {story_id} ({domain}), attempt {attempts}/{MAX_RETRIES}"
+                    )
+
+            elif result.status == "quota_exceeded":
+                # Daily quota exceeded (Free plan) - put back and wait
                 db.retry_content_job(story_id)
-                print(
-                    f"  [worker-{worker_id}] blocked {story_id} ({domain}), attempt {attempts}/{MAX_RETRIES}"
+                log.warning(
+                    f"[worker-{worker_id}] Quota exceeded, waiting for UTC midnight..."
                 )
+                await asyncio.sleep(60)
 
-        elif result.status == "timeout":
-            if attempts >= MAX_RETRIES:
-                db.complete_content_job(story_id, "", "failed", result.source)
-                print(
-                    f"  [worker-{worker_id}] FAILED {story_id} ({domain}) - timeouts after {attempts} attempts"
-                )
-            else:
+            elif result.status == "rate_limited":
+                # Rate limited by CF - put back and set global delay
                 db.retry_content_job(story_id)
-                print(
-                    f"  [worker-{worker_id}] timeout {story_id} ({domain}), attempt {attempts}/{MAX_RETRIES}"
+                delay = 60  # default
+                if result.error and "retry after" in result.error.lower():
+                    try:
+                        delay = int(result.error.split()[-1].rstrip("s"))
+                    except (ValueError, IndexError):
+                        pass
+                async with cf_rate_limit_lock:
+                    cf_rate_limit_until = time.time() + delay
+                log.info(
+                    f"[worker-{worker_id}] CF rate limited, all workers waiting {delay}s..."
                 )
 
-        elif result.status == "quota_exceeded":
-            # Daily quota exceeded (Free plan) - put back and wait
-            db.retry_content_job(story_id)
-            print(f"  [worker-{worker_id}] Quota exceeded, waiting for UTC midnight...")
-            await asyncio.sleep(60)
-
-        elif result.status == "rate_limited":
-            # Rate limited by CF - put back and set global delay
-            db.retry_content_job(story_id)
-            delay = 60  # default
-            if result.error and "retry after" in result.error.lower():
-                try:
-                    delay = int(result.error.split()[-1].rstrip("s"))
-                except (ValueError, IndexError):
-                    pass
-            async with cf_rate_limit_lock:
-                cf_rate_limit_until = time.time() + delay
-            print(
-                f"  [worker-{worker_id}] CF rate limited, all workers waiting {delay}s..."
-            )
-
-        else:
-            # Other failure
-            if attempts >= MAX_RETRIES:
-                db.complete_content_job(story_id, "", "failed", result.source)
-                print(
-                    f"  [worker-{worker_id}] FAILED {story_id} ({domain}) - {result.error}"
-                )
             else:
-                db.retry_content_job(story_id)
-                print(
-                    f"  [worker-{worker_id}] failed {story_id} ({domain}), attempt {attempts}/{MAX_RETRIES}: {result.error}"
-                )
+                # Other failure
+                if attempts >= MAX_RETRIES:
+                    db.complete_content_job(story_id, "", "failed", result.source)
+                    log.warning(
+                        f"[worker-{worker_id}] FAILED {story_id} ({domain}) - {result.error}"
+                    )
+                else:
+                    db.retry_content_job(story_id)
+                    log.info(
+                        f"[worker-{worker_id}] failed {story_id} ({domain}), attempt {attempts}/{MAX_RETRIES}: {result.error}"
+                    )
 
-    print(f"  [worker-{worker_id}] stopped")
+        except Exception as e:
+            # Unexpected error - ensure job doesn't stay stuck in 'fetching'
+            log.error(f"[worker-{worker_id}] unexpected error for {story_id}: {e}")
+            try:
+                if attempts >= MAX_RETRIES:
+                    db.complete_content_job(story_id, "", "failed")
+                else:
+                    db.retry_content_job(story_id)
+            except Exception:
+                pass  # Best effort - cleanup will catch it later
+
+    log.info(f"[worker-{worker_id}] stopped")
 
 
 async def story_fetcher(
     db: Database, stop_event: asyncio.Event, interval_minutes: int = 60
 ):
     """Background task that fetches new stories on a schedule."""
-    print(f"Story fetcher started (interval: {interval_minutes}m)")
+    log.info(f"Story fetcher started (interval: {interval_minutes}m)")
 
     # Fetch immediately on start
-    print("  [fetcher] Initial fetch...")
+    log.info("[fetcher] Initial fetch...")
     try:
         count = await fetch_new_stories(db)
-        print(f"  [fetcher] Initial fetch complete: {count} stories")
+        log.info(f"[fetcher] Initial fetch complete: {count} stories")
     except Exception as e:
-        print(f"  [fetcher] Initial fetch error: {e}")
+        log.error(f"[fetcher] Initial fetch error: {e}")
 
     # Schedule subsequent fetches on the hour
     while not stop_event.is_set():
@@ -1385,8 +1584,8 @@ async def story_fetcher(
         seconds_until_next = minutes_until_next * 60 - now.second
 
         if seconds_until_next > 0:
-            print(
-                f"  [fetcher] Next fetch in {seconds_until_next // 60}m {seconds_until_next % 60}s"
+            log.debug(
+                f"[fetcher] Next fetch in {seconds_until_next // 60}m {seconds_until_next % 60}s"
             )
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=seconds_until_next)
@@ -1397,16 +1596,45 @@ async def story_fetcher(
         if stop_event.is_set():
             break
 
-        print(
-            f"  [fetcher] Scheduled fetch at {datetime.now().strftime('%H:%M:%S')}..."
+        log.info(
+            f"[fetcher] Scheduled fetch at {datetime.now().strftime('%H:%M:%S')}..."
         )
         try:
             count = await fetch_new_stories(db)
-            print(f"  [fetcher] Fetched {count} new stories")
+            log.info(f"[fetcher] Fetched {count} new stories")
         except Exception as e:
-            print(f"  [fetcher] Fetch error: {e}")
+            log.error(f"[fetcher] Fetch error: {e}")
 
-    print("Story fetcher stopped")
+    log.info("Story fetcher stopped")
+
+
+async def front_page_tracker(db: Database, stop_event: asyncio.Event):
+    """Background task that polls topstories to track which stories hit the front page."""
+    log.info(f"Front page tracker started (interval: {FRONT_PAGE_POLL_INTERVAL}s)")
+
+    while not stop_event.is_set():
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(HN_TOP_STORIES, timeout=30)
+                resp.raise_for_status()
+                top_ids = resp.json()
+
+                if top_ids:
+                    updated = db.update_front_page_stories(top_ids)
+                    if updated > 0:
+                        log.info(f"[front-page] Updated {updated} stories")
+
+        except Exception as e:
+            log.error(f"[front-page] Error polling topstories: {e}")
+
+        # Wait for next poll
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=FRONT_PAGE_POLL_INTERVAL)
+            break  # Stop event was set
+        except asyncio.TimeoutError:
+            pass  # Time to poll again
+
+    log.info("Front page tracker stopped")
 
 
 # =============================================================================
@@ -1417,6 +1645,7 @@ async def story_fetcher(
 db: Database = None
 content_workers: list[asyncio.Task] = []
 story_fetcher_task: asyncio.Task = None
+front_page_tracker_task: asyncio.Task = None
 stop_event: asyncio.Event = None
 fetch_status: dict = {"status": "idle", "progress": 0, "total": 0, "fetched": 0}
 cf_quota_exceeded_until: float = 0  # UTC timestamp when quota resets (0 = not exceeded)
@@ -1430,18 +1659,24 @@ DEFAULT_CONTENT_WORKERS = 3
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db, content_workers, stop_event, story_fetcher_task
+    global db, content_workers, stop_event, story_fetcher_task, front_page_tracker_task
 
     # Initialize
     db = Database(DB_FILE)
     db.init()
     stop_event = asyncio.Event()
 
+    # Clean up any stuck content jobs from previous run (e.g., server crash)
+    db.cleanup_stuck_content_jobs(max_attempts=MAX_RETRIES)
+
     # Start story fetcher (background, non-blocking)
     # Fetches immediately then on schedule
     story_fetcher_task = asyncio.create_task(
         story_fetcher(db, stop_event, app.state.fetch_interval)
     )
+
+    # Start front page tracker (polls topstories to detect front page hits)
+    front_page_tracker_task = asyncio.create_task(front_page_tracker(db, stop_event))
 
     # Start content workers
     # Multiple workers can run concurrently - they coordinate via:
@@ -1452,14 +1687,14 @@ async def lifespan(app: FastAPI):
     for i in range(num_workers):
         task = asyncio.create_task(content_worker(i + 1, db, stop_event))
         content_workers.append(task)
-    print(f"Started {num_workers} content worker(s)")
+    log.info(f"Started {num_workers} content worker(s)")
 
-    print(f"Server ready - http://127.0.0.1:{app.state.port}")
+    log.info(f"Server ready - http://127.0.0.1:{app.state.port}")
 
     yield
 
     # Shutdown
-    print("\nShutting down...")
+    log.info("Shutting down...")
     stop_event.set()
 
     # Cancel story fetcher
@@ -1470,11 +1705,19 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+    # Cancel front page tracker
+    if front_page_tracker_task:
+        front_page_tracker_task.cancel()
+        try:
+            await front_page_tracker_task
+        except asyncio.CancelledError:
+            pass
+
     # Cancel content workers
     for task in content_workers:
         task.cancel()
     await asyncio.gather(*content_workers, return_exceptions=True)
-    print("Shutdown complete")
+    log.info("Shutdown complete")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1587,7 +1830,7 @@ elif FRONTEND_ZIP.exists():
     templates = Jinja2Templates(directory=_temp_dir)
 else:
     templates = None
-    print("WARNING: No frontend found (neither frontend/ dir nor ui.zip)")
+    log.warning("No frontend found (neither frontend/ dir nor ui.zip)")
 
 
 # --- HTML Routes ---
@@ -1921,9 +2164,8 @@ async def main_async(args):
 
     # Validate Cloudflare credentials
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        print("WARNING: CF_ACCOUNT_ID and CF_API_TOKEN not set!")
-        print("Content extraction will not work. Set these in .env file.")
-        print()
+        log.warning("CF_ACCOUNT_ID and CF_API_TOKEN not set!")
+        log.warning("Content extraction will not work. Set these in .env file.")
 
     # Initialize DB
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1938,7 +2180,7 @@ async def main_async(args):
         db.execute("DELETE FROM dismissed")
         db.execute("DELETE FROM history")
         db.commit()
-        print(
+        log.info(
             "Reset complete - all stories cleared. Next fetch will look back from now."
         )
         return
@@ -1957,10 +2199,9 @@ async def main_async(args):
 
     # Start server
     host = "0.0.0.0" if args.public else "127.0.0.1"
-    print(f"Starting server on http://{host}:{args.port}")
+    log.info(f"Starting server on http://{host}:{args.port}")
     if args.user:
-        print(f"Basic auth enabled (user: {args.user})")
-    print("Press Ctrl+C to stop\n")
+        log.info(f"Basic auth enabled (user: {args.user})")
 
     import uvicorn
 
@@ -2003,7 +2244,10 @@ def main():
             os.environ.get("HN_CONTENT_WORKERS", DEFAULT_CONTENT_WORKERS)
         )
 
-    asyncio.run(main_async(args))
+    try:
+        asyncio.run(main_async(args))
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass  # Graceful shutdown already handled in lifespan
 
 
 if __name__ == "__main__":
