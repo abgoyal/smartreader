@@ -1,0 +1,2010 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx",
+#     "fastapi",
+#     "uvicorn",
+#     "jinja2",
+# ]
+# ///
+"""
+HackerNews "new" story browser with content extraction.
+
+Fetches new stories on a schedule (hourly by default), extracts article content
+via Cloudflare Browser Rendering API, serves a fast keyboard-navigable UI.
+All configuration (filters, merit/demerit, read-later) managed via UI.
+
+Usage:
+    ./hn_new.py                  # Start server (localhost:8000)
+    ./hn_new.py --public         # Bind to all interfaces (0.0.0.0)
+    ./hn_new.py --port 8080      # Custom port
+    ./hn_new.py --reset          # Reset checkpoint to now
+
+Environment variables (see .env.example):
+    CF_ACCOUNT_ID       - Cloudflare account ID (required)
+    CF_API_TOKEN        - Cloudflare API token (required)
+    HN_USER             - Basic auth username (optional)
+    HN_PASSWORD         - Basic auth password (optional)
+    CF_BROWSER_TIMEOUT_MS - Page load timeout in ms (default: 2000, max: 60000)
+    HN_FETCH_INTERVAL   - Minutes between fetches (default: 60)
+    HN_CONTENT_WORKERS  - Content extraction workers (default: 3)
+"""
+
+import argparse
+import asyncio
+import base64
+import os
+import re
+import secrets
+import sqlite3
+import sys
+import tempfile
+import threading
+import time
+import zipfile
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse
+
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+DATA_DIR = Path(__file__).parent / ".hn_data"
+DB_FILE = DATA_DIR / "hn.db"
+FRONTEND_DIR = Path(__file__).parent / "frontend"
+FRONTEND_ZIP = Path(__file__).parent / "ui.zip"  # Alternative: serve from zip
+
+HN_API_BASE = "https://hacker-news.firebaseio.com/v0"
+HN_NEW_STORIES = f"{HN_API_BASE}/newstories.json"
+HN_ITEM = f"{HN_API_BASE}/item/{{id}}.json"
+
+TEASER_LENGTH = 300  # characters for teaser
+
+# Fetch settings
+DEFAULT_LOOKBACK_HOURS = 80  # ~3 days for initial fetch
+ALGOLIA_PAGE_SIZE = 100
+ALGOLIA_MAX_PAGES = 100  # 5000 stories max via Algolia
+ID_WALK_DELAY = 0.5  # seconds between ID walk requests
+ID_WALK_BATCH_SIZE = 500  # how many IDs to walk before checking if we're done
+
+# Rate limiting for content fetching (per domain)
+DOMAIN_REQUEST_DELAY = 2.0  # seconds between requests to same domain
+
+# Story fetch scheduling
+FETCH_INTERVAL_MINUTES = 60  # Fetch new stories every hour
+
+# Cloudflare Browser Rendering settings
+CF_BROWSER_TIMEOUT_MS = 2000  # Max time to wait for page load (default 2s, max 60s)
+
+# Cloudflare Browser Rendering API (from environment)
+# Load .env file if present
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    for line in _env_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
+
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
+CF_BROWSER_API = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/browser-rendering/markdown"
+
+# =============================================================================
+# Database Schema & Operations
+# =============================================================================
+
+SCHEMA = """
+-- Stories fetched from HN
+CREATE TABLE IF NOT EXISTS stories (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    url TEXT,
+    domain TEXT,
+    by TEXT,
+    time INTEGER,
+    score INTEGER DEFAULT 0,
+    descendants INTEGER DEFAULT 0,
+    content TEXT,  -- extracted markdown content
+    content_status TEXT DEFAULT 'pending',  -- pending, fetching, retry, done, failed, blocked, skipped
+    content_attempts INTEGER DEFAULT 0,  -- number of fetch attempts (for retry limiting)
+    content_source TEXT,  -- 'cloudflare'
+    browser_ms REAL DEFAULT 0,  -- Cloudflare billing: browser milliseconds used
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Track URLs we've already fetched content for (dedup across stories)
+CREATE TABLE IF NOT EXISTS fetched_urls (
+    url TEXT PRIMARY KEY,
+    content TEXT,
+    content_source TEXT,
+    browser_ms REAL DEFAULT 0,
+    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Usage tracking for Cloudflare billing
+CREATE TABLE IF NOT EXISTS usage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    story_id INTEGER,
+    url TEXT,
+    browser_ms REAL,
+    source TEXT,  -- 'cloudflare'
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Blocked domains (never show stories from these)
+CREATE TABLE IF NOT EXISTS blocked_domains (
+    domain TEXT PRIMARY KEY,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Blocked words in titles (never show stories containing these)
+CREATE TABLE IF NOT EXISTS blocked_words (
+    word TEXT PRIMARY KEY,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Merit words (boost these stories)
+CREATE TABLE IF NOT EXISTS merit_words (
+    word TEXT PRIMARY KEY,
+    weight INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Demerit words (penalize these stories)
+CREATE TABLE IF NOT EXISTS demerit_words (
+    word TEXT PRIMARY KEY,
+    weight INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Merit domains
+CREATE TABLE IF NOT EXISTS merit_domains (
+    domain TEXT PRIMARY KEY,
+    weight INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Demerit domains
+CREATE TABLE IF NOT EXISTS demerit_domains (
+    domain TEXT PRIMARY KEY,
+    weight INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Read later list
+CREATE TABLE IF NOT EXISTS read_later (
+    story_id INTEGER PRIMARY KEY REFERENCES stories(id),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Dismissed stories (hide from current session)
+CREATE TABLE IF NOT EXISTS dismissed (
+    story_id INTEGER PRIMARY KEY REFERENCES stories(id),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Reading history (stories you've opened)
+CREATE TABLE IF NOT EXISTS history (
+    story_id INTEGER PRIMARY KEY REFERENCES stories(id),
+    opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_stories_domain ON stories(domain);
+CREATE INDEX IF NOT EXISTS idx_stories_time ON stories(time DESC);
+CREATE INDEX IF NOT EXISTS idx_stories_content_status ON stories(content_status);
+CREATE INDEX IF NOT EXISTS idx_stories_content_queue ON stories(content_status, content_attempts, time);
+"""
+
+
+class Database:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        if not hasattr(self._local, "conn"):
+            self._local.conn = sqlite3.connect(
+                str(self.db_path), check_same_thread=False
+            )
+            self._local.conn.row_factory = sqlite3.Row
+            self._local.conn.execute("PRAGMA foreign_keys = ON")
+            self._local.conn.execute("PRAGMA journal_mode = WAL")
+        return self._local.conn
+
+    def init(self):
+        conn = self._get_conn()
+        conn.executescript(SCHEMA)
+        conn.commit()
+
+    def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        return self._get_conn().execute(sql, params)
+
+    def executemany(self, sql: str, params_list: list) -> sqlite3.Cursor:
+        return self._get_conn().executemany(sql, params_list)
+
+    def commit(self):
+        self._get_conn().commit()
+
+    def fetchone(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
+        return self.execute(sql, params).fetchone()
+
+    def fetchall(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        return self.execute(sql, params).fetchall()
+
+    # --- Story operations ---
+
+    def upsert_story(self, story: dict):
+        self.execute(
+            """
+            INSERT INTO stories (id, title, url, domain, by, time, score, descendants)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                score = excluded.score,
+                descendants = excluded.descendants,
+                updated_at = CURRENT_TIMESTAMP
+        """,
+            (
+                story["id"],
+                story["title"],
+                story.get("url"),
+                story.get("domain"),
+                story.get("by"),
+                story.get("time"),
+                story.get("score", 0),
+                story.get("descendants", 0),
+            ),
+        )
+
+    def get_stories(
+        self, include_dismissed: bool = False, include_blocked: bool = False
+    ) -> list[dict]:
+        """Get stories with computed scores, filtering, and deduplication."""
+        query = """
+            WITH scored AS (
+                SELECT
+                    s.*,
+                    COALESCE(md.weight, 0) as domain_merit,
+                    COALESCE(dd.weight, 0) as domain_demerit,
+                    CASE WHEN rl.story_id IS NOT NULL THEN 1 ELSE 0 END as is_read_later,
+                    CASE WHEN d.story_id IS NOT NULL THEN 1 ELSE 0 END as is_dismissed,
+                    CASE WHEN h.story_id IS NOT NULL THEN 1 ELSE 0 END as is_read,
+                    CASE WHEN bd.domain IS NOT NULL THEN 1 ELSE 0 END as is_domain_blocked
+                FROM stories s
+                LEFT JOIN merit_domains md ON s.domain = md.domain
+                LEFT JOIN demerit_domains dd ON s.domain = dd.domain
+                LEFT JOIN read_later rl ON s.id = rl.story_id
+                LEFT JOIN dismissed d ON s.id = d.story_id
+                LEFT JOIN history h ON s.id = h.story_id
+                LEFT JOIN blocked_domains bd ON s.domain = bd.domain
+            )
+            SELECT * FROM scored
+            WHERE 1=1
+        """
+        if not include_dismissed:
+            query += " AND is_dismissed = 0"
+        if not include_blocked:
+            query += " AND is_domain_blocked = 0"
+
+        query += " ORDER BY time DESC"
+
+        rows = self.fetchall(query)
+        stories = []
+        seen_urls = set()
+
+        # Get merit/demerit words for scoring
+        merit_words = {
+            r["word"].lower(): r["weight"]
+            for r in self.fetchall("SELECT word, weight FROM merit_words")
+        }
+        demerit_words = {
+            r["word"].lower(): r["weight"]
+            for r in self.fetchall("SELECT word, weight FROM demerit_words")
+        }
+        blocked_words = {
+            r["word"].lower() for r in self.fetchall("SELECT word FROM blocked_words")
+        }
+
+        for row in rows:
+            story = dict(row)
+
+            # Skip blocked words in title
+            title_lower = story["title"].lower()
+            if not include_blocked and any(bw in title_lower for bw in blocked_words):
+                continue
+
+            # Deduplication: keep story with most engagement
+            url = story.get("url") or f"hn:{story['id']}"
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            # Compute word-based score
+            word_merit = sum(
+                w for word, w in merit_words.items() if word in title_lower
+            )
+            word_demerit = sum(
+                w for word, w in demerit_words.items() if word in title_lower
+            )
+
+            story["merit_score"] = story["domain_merit"] + word_merit
+            story["demerit_score"] = story["domain_demerit"] + word_demerit
+            story["net_score"] = story["merit_score"] - story["demerit_score"]
+
+            # Generate teaser from content
+            if story.get("content"):
+                story["teaser"] = story["content"][:TEASER_LENGTH].strip()
+                if len(story["content"]) > TEASER_LENGTH:
+                    story["teaser"] += "..."
+            else:
+                story["teaser"] = None
+
+            stories.append(story)
+
+        return stories
+
+    def update_content(
+        self,
+        story_id: int,
+        content: str,
+        status: str = "done",
+        source: str = None,
+        browser_ms: float = 0,
+    ):
+        self.execute(
+            """
+            UPDATE stories SET content = ?, content_status = ?, content_source = ?,
+                browser_ms = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """,
+            (content, status, source, browser_ms, story_id),
+        )
+        self.commit()
+
+    # --- Content Queue (atomic operations for single worker) ---
+
+    def claim_next_content_job(self, max_attempts: int = 3) -> Optional[dict]:
+        """
+        Atomically claim the next story needing content fetch.
+        Returns story dict or None if no work available.
+
+        Uses UPDATE...RETURNING (SQLite 3.35+) for true atomicity - the subquery
+        and update happen as one operation, preventing race conditions where
+        multiple workers could claim the same job.
+        """
+        # Atomic claim: UPDATE with subquery finds and claims in one operation
+        # This prevents TOCTOU race conditions with multiple workers
+        row = self.fetchone(
+            """
+            UPDATE stories
+            SET content_status = 'fetching',
+                content_attempts = content_attempts + 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = (
+                SELECT id FROM stories
+                WHERE content_status IN ('pending', 'retry')
+                  AND url IS NOT NULL
+                  AND content_attempts < ?
+                ORDER BY content_attempts ASC, time ASC
+                LIMIT 1
+            )
+            RETURNING id, url, domain, content_attempts
+        """,
+            (max_attempts,),
+        )
+        if row:
+            self.commit()
+            return dict(row)
+        return None
+
+    def complete_content_job(
+        self,
+        story_id: int,
+        content: str,
+        status: str,
+        source: str = None,
+        browser_ms: float = 0,
+    ):
+        """Mark a content fetch job as complete (done, failed, blocked, skipped)."""
+        self.execute(
+            """
+            UPDATE stories
+            SET content = ?, content_status = ?, content_source = ?,
+                browser_ms = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """,
+            (content, status, source, browser_ms, story_id),
+        )
+        self.commit()
+
+    def retry_content_job(self, story_id: int):
+        """Mark a content fetch job for retry."""
+        self.execute(
+            """
+            UPDATE stories
+            SET content_status = 'retry', updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """,
+            (story_id,),
+        )
+        self.commit()
+
+    def get_content_queue_stats(self) -> dict:
+        """Get stats about the content fetch queue."""
+        row = self.fetchone("""
+            SELECT
+                SUM(CASE WHEN content_status = 'pending' THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN content_status = 'retry' THEN 1 ELSE 0 END) as retry,
+                SUM(CASE WHEN content_status = 'fetching' THEN 1 ELSE 0 END) as fetching,
+                SUM(CASE WHEN content_status = 'done' THEN 1 ELSE 0 END) as done,
+                SUM(CASE WHEN content_status = 'failed' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN content_status = 'blocked' THEN 1 ELSE 0 END) as blocked,
+                SUM(CASE WHEN content_status = 'skipped' THEN 1 ELSE 0 END) as skipped
+            FROM stories WHERE url IS NOT NULL
+        """)
+        return dict(row) if row else {}
+
+    # --- Story Sync Checkpoint (derived from stories table) ---
+
+    def get_newest_story_time(self) -> Optional[int]:
+        """Get the timestamp of the newest story we have (our sync checkpoint)."""
+        row = self.fetchone("SELECT MAX(time) as max_time FROM stories")
+        return row["max_time"] if row and row["max_time"] else None
+
+    def get_oldest_story_time(self) -> Optional[int]:
+        """Get the timestamp of the oldest story we have."""
+        row = self.fetchone("SELECT MIN(time) as min_time FROM stories")
+        return row["min_time"] if row and row["min_time"] else None
+
+    # --- Blocked domains/words ---
+
+    def add_blocked_domain(self, domain: str):
+        self.execute(
+            "INSERT OR IGNORE INTO blocked_domains (domain) VALUES (?)", (domain,)
+        )
+        self.commit()
+
+    def remove_blocked_domain(self, domain: str):
+        self.execute("DELETE FROM blocked_domains WHERE domain = ?", (domain,))
+        self.commit()
+
+    def get_blocked_domains(self) -> list[str]:
+        return [
+            r["domain"]
+            for r in self.fetchall("SELECT domain FROM blocked_domains ORDER BY domain")
+        ]
+
+    def add_blocked_word(self, word: str):
+        self.execute(
+            "INSERT OR IGNORE INTO blocked_words (word) VALUES (?)", (word.lower(),)
+        )
+        self.commit()
+
+    def remove_blocked_word(self, word: str):
+        self.execute("DELETE FROM blocked_words WHERE word = ?", (word.lower(),))
+        self.commit()
+
+    def get_blocked_words(self) -> list[str]:
+        return [
+            r["word"]
+            for r in self.fetchall("SELECT word FROM blocked_words ORDER BY word")
+        ]
+
+    # --- Merit/Demerit ---
+
+    def add_merit_word(self, word: str, weight: int = 1):
+        self.execute(
+            "INSERT OR REPLACE INTO merit_words (word, weight) VALUES (?, ?)",
+            (word.lower(), weight),
+        )
+        self.commit()
+
+    def remove_merit_word(self, word: str):
+        self.execute("DELETE FROM merit_words WHERE word = ?", (word.lower(),))
+        self.commit()
+
+    def get_merit_words(self) -> list[dict]:
+        return [
+            dict(r)
+            for r in self.fetchall("SELECT word, weight FROM merit_words ORDER BY word")
+        ]
+
+    def add_demerit_word(self, word: str, weight: int = 1):
+        self.execute(
+            "INSERT OR REPLACE INTO demerit_words (word, weight) VALUES (?, ?)",
+            (word.lower(), weight),
+        )
+        self.commit()
+
+    def remove_demerit_word(self, word: str):
+        self.execute("DELETE FROM demerit_words WHERE word = ?", (word.lower(),))
+        self.commit()
+
+    def get_demerit_words(self) -> list[dict]:
+        return [
+            dict(r)
+            for r in self.fetchall(
+                "SELECT word, weight FROM demerit_words ORDER BY word"
+            )
+        ]
+
+    def add_merit_domain(self, domain: str, weight: int = 1):
+        self.execute(
+            "INSERT OR REPLACE INTO merit_domains (domain, weight) VALUES (?, ?)",
+            (domain, weight),
+        )
+        self.commit()
+
+    def remove_merit_domain(self, domain: str):
+        self.execute("DELETE FROM merit_domains WHERE domain = ?", (domain,))
+        self.commit()
+
+    def get_merit_domains(self) -> list[dict]:
+        return [
+            dict(r)
+            for r in self.fetchall(
+                "SELECT domain, weight FROM merit_domains ORDER BY domain"
+            )
+        ]
+
+    def add_demerit_domain(self, domain: str, weight: int = 1):
+        self.execute(
+            "INSERT OR REPLACE INTO demerit_domains (domain, weight) VALUES (?, ?)",
+            (domain, weight),
+        )
+        self.commit()
+
+    def remove_demerit_domain(self, domain: str):
+        self.execute("DELETE FROM demerit_domains WHERE domain = ?", (domain,))
+        self.commit()
+
+    def get_demerit_domains(self) -> list[dict]:
+        return [
+            dict(r)
+            for r in self.fetchall(
+                "SELECT domain, weight FROM demerit_domains ORDER BY domain"
+            )
+        ]
+
+    # --- Read later ---
+
+    def add_read_later(self, story_id: int):
+        self.execute(
+            "INSERT OR IGNORE INTO read_later (story_id) VALUES (?)", (story_id,)
+        )
+        self.commit()
+
+    def remove_read_later(self, story_id: int):
+        self.execute("DELETE FROM read_later WHERE story_id = ?", (story_id,))
+        self.commit()
+
+    def get_read_later(self) -> list[dict]:
+        rows = self.fetchall("""
+            SELECT s.* FROM stories s
+            JOIN read_later rl ON s.id = rl.story_id
+            ORDER BY rl.created_at DESC
+        """)
+        return [dict(r) for r in rows]
+
+    # --- Dismissed ---
+
+    def dismiss_story(self, story_id: int):
+        self.execute(
+            "INSERT OR IGNORE INTO dismissed (story_id) VALUES (?)", (story_id,)
+        )
+        self.commit()
+
+    def undismiss_story(self, story_id: int):
+        self.execute("DELETE FROM dismissed WHERE story_id = ?", (story_id,))
+        self.commit()
+
+    def clear_dismissed(self):
+        self.execute("DELETE FROM dismissed")
+        self.commit()
+
+    # --- History ---
+
+    def add_to_history(self, story_id: int):
+        self.execute(
+            "INSERT OR REPLACE INTO history (story_id, opened_at) VALUES (?, CURRENT_TIMESTAMP)",
+            (story_id,),
+        )
+        self.commit()
+
+    # --- URL Dedup ---
+
+    def get_cached_content(self, url: str) -> Optional[dict]:
+        """Check if we already fetched this URL."""
+        row = self.fetchone(
+            "SELECT content, content_source, browser_ms FROM fetched_urls WHERE url = ?",
+            (url,),
+        )
+        if row:
+            return {
+                "content": row["content"],
+                "source": row["content_source"],
+                "browser_ms": row["browser_ms"],
+            }
+        return None
+
+    def cache_content(self, url: str, content: str, source: str, browser_ms: float = 0):
+        """Cache fetched content for URL dedup."""
+        self.execute(
+            """
+            INSERT OR REPLACE INTO fetched_urls (url, content, content_source, browser_ms, fetched_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """,
+            (url, content, source, browser_ms),
+        )
+        self.commit()
+
+    # --- Usage Tracking ---
+
+    def log_usage(self, story_id: int, url: str, browser_ms: float, source: str):
+        """Log usage for billing tracking."""
+        self.execute(
+            """
+            INSERT INTO usage_log (story_id, url, browser_ms, source) VALUES (?, ?, ?, ?)
+        """,
+            (story_id, url, browser_ms, source),
+        )
+        self.commit()
+
+    def get_usage_stats(self) -> dict:
+        """Get usage statistics for billing."""
+        today = self.fetchone("""
+            SELECT COALESCE(SUM(browser_ms), 0) as ms, COUNT(*) as requests
+            FROM usage_log WHERE date(created_at) = date('now')
+        """)
+        week = self.fetchone("""
+            SELECT COALESCE(SUM(browser_ms), 0) as ms, COUNT(*) as requests
+            FROM usage_log WHERE created_at >= datetime('now', '-7 days')
+        """)
+        month = self.fetchone("""
+            SELECT COALESCE(SUM(browser_ms), 0) as ms, COUNT(*) as requests
+            FROM usage_log WHERE created_at >= datetime('now', '-30 days')
+        """)
+        total = self.fetchone("""
+            SELECT COALESCE(SUM(browser_ms), 0) as ms, COUNT(*) as requests FROM usage_log
+        """)
+        by_source = self.fetchall("""
+            SELECT source, COALESCE(SUM(browser_ms), 0) as ms, COUNT(*) as requests
+            FROM usage_log GROUP BY source
+        """)
+        return {
+            "today": {"browser_ms": today["ms"], "requests": today["requests"]},
+            "week": {"browser_ms": week["ms"], "requests": week["requests"]},
+            "month": {"browser_ms": month["ms"], "requests": month["requests"]},
+            "total": {"browser_ms": total["ms"], "requests": total["requests"]},
+            "by_source": {
+                r["source"]: {"browser_ms": r["ms"], "requests": r["requests"]}
+                for r in by_source
+            },
+        }
+
+    # --- Stats ---
+
+    def get_stats(self) -> dict:
+        return {
+            "total_stories": self.fetchone("SELECT COUNT(*) as c FROM stories")["c"],
+            "pending_content": self.fetchone(
+                "SELECT COUNT(*) as c FROM stories WHERE content_status = 'pending'"
+            )["c"],
+            "fetching_content": self.fetchone(
+                "SELECT COUNT(*) as c FROM stories WHERE content_status = 'fetching'"
+            )["c"],
+            "done_content": self.fetchone(
+                "SELECT COUNT(*) as c FROM stories WHERE content_status = 'done'"
+            )["c"],
+            "failed_content": self.fetchone(
+                "SELECT COUNT(*) as c FROM stories WHERE content_status = 'failed'"
+            )["c"],
+            "blocked_content": self.fetchone(
+                "SELECT COUNT(*) as c FROM stories WHERE content_status = 'blocked'"
+            )["c"],
+            "blocked_domains": self.fetchone(
+                "SELECT COUNT(*) as c FROM blocked_domains"
+            )["c"],
+            "blocked_words": self.fetchone("SELECT COUNT(*) as c FROM blocked_words")[
+                "c"
+            ],
+            "read_later": self.fetchone("SELECT COUNT(*) as c FROM read_later")["c"],
+            "dismissed": self.fetchone("SELECT COUNT(*) as c FROM dismissed")["c"],
+        }
+
+
+# =============================================================================
+# HN API Client
+# =============================================================================
+
+
+def extract_domain(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return domain
+    except Exception:
+        return None
+
+
+def parse_algolia_story(hit: dict) -> Optional[dict]:
+    """Parse Algolia API hit into our story format."""
+    if hit.get("_tags") and "story" not in hit.get("_tags", []):
+        return None
+    return {
+        "id": int(hit["objectID"]),
+        "title": hit.get("title") or "[no title]",
+        "url": hit.get("url"),
+        "domain": extract_domain(hit.get("url")),
+        "by": hit.get("author") or "[deleted]",
+        "time": hit.get("created_at_i", 0),
+        "score": hit.get("points") or 0,
+        "descendants": hit.get("num_comments") or 0,
+    }
+
+
+async def fetch_via_algolia(
+    client: httpx.AsyncClient, since_time: int, on_progress=None
+) -> tuple[list[dict], bool]:
+    """
+    Fetch stories via Algolia API using keyset pagination.
+    Algolia limits results to ~1000 per query, so we paginate by time windows.
+    Fetches ALL stories back to since_time.
+    Returns (stories, success).
+    """
+    all_stories = []
+    # Use keyset pagination: fetch batches, then use oldest timestamp as upper bound
+    upper_bound = None  # No upper bound initially (fetch newest first)
+
+    while True:  # Keep fetching until we reach since_time
+        # Fetch one batch (up to 1000 results due to Algolia limit)
+        batch_stories = []
+        page = 0
+
+        while len(batch_stories) < 1000 and page < 10:  # Algolia caps at ~10 pages
+            try:
+                # Build numeric filter
+                filters = [f"created_at_i>{since_time}"]
+                if upper_bound:
+                    filters.append(f"created_at_i<{upper_bound}")
+
+                url = (
+                    f"https://hn.algolia.com/api/v1/search_by_date"
+                    f"?tags=story"
+                    f"&numericFilters={','.join(filters)}"
+                    f"&hitsPerPage={ALGOLIA_PAGE_SIZE}"
+                    f"&page={page}"
+                )
+                resp = await client.get(url, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+
+                hits = data.get("hits", [])
+                if not hits:
+                    break
+
+                for hit in hits:
+                    story = parse_algolia_story(hit)
+                    if story and story["time"] > since_time:
+                        batch_stories.append(story)
+
+                page += 1
+                total_pages = data.get("nbPages", 0)
+                if page >= total_pages:
+                    break
+
+                await asyncio.sleep(0.1)  # Be nice to Algolia
+
+            except Exception as e:
+                print(f"Algolia API error: {e}", file=sys.stderr)
+                if page == 0 and not all_stories:
+                    return [], False  # Complete failure on first request
+                break  # Partial success, continue with what we have
+
+        if not batch_stories:
+            break  # No more stories to fetch
+
+        all_stories.extend(batch_stories)
+        print(
+            f"  Algolia batch: {len(batch_stories)} stories (total: {len(all_stories)})"
+        )
+
+        # Check if we've reached the time boundary
+        oldest_in_batch = min(s["time"] for s in batch_stories)
+        if oldest_in_batch <= since_time:
+            break  # We've fetched everything back to the checkpoint
+
+        # Check if this batch was incomplete (less than limit = we got everything)
+        if len(batch_stories) < 1000:
+            break  # Algolia returned all available stories
+
+        # Set upper bound for next batch (keyset pagination)
+        upper_bound = oldest_in_batch
+        await asyncio.sleep(0.2)  # Brief pause between batches
+
+    return all_stories, True
+
+
+async def fetch_via_firebase(client: httpx.AsyncClient) -> list[int]:
+    """Fetch list of new story IDs from Firebase API."""
+    try:
+        resp = await client.get(HN_NEW_STORIES, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"Firebase API error: {e}", file=sys.stderr)
+        return []
+
+
+async def fetch_story_by_id(client: httpx.AsyncClient, story_id: int) -> Optional[dict]:
+    """Fetch a single story by ID from Firebase API."""
+    try:
+        resp = await client.get(HN_ITEM.format(id=story_id), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if data is None or data.get("type") != "story":
+            return None
+        return {
+            "id": data["id"],
+            "title": data.get("title", "[no title]"),
+            "url": data.get("url"),
+            "domain": extract_domain(data.get("url")),
+            "by": data.get("by", "[deleted]"),
+            "time": data.get("time", 0),
+            "score": data.get("score", 0),
+            "descendants": data.get("descendants", 0),
+        }
+    except Exception:
+        return None
+
+
+async def fetch_via_firebase_newstories(
+    client: httpx.AsyncClient,
+    since_time: int,
+    since_id: Optional[int],
+    on_progress=None,
+) -> tuple[list[dict], int]:
+    """
+    Fetch stories via Firebase newstories endpoint.
+    Limited to ~500 most recent stories (API limitation).
+    Returns (stories, max_id_seen).
+    """
+    stories = []
+    max_id_seen = 0
+
+    story_ids = await fetch_via_firebase(client)
+    if not story_ids:
+        return [], 0
+
+    print(f"  Firebase: fetching from {len(story_ids)} story IDs...")
+
+    for i, sid in enumerate(story_ids):
+        max_id_seen = max(max_id_seen, sid)
+
+        # Stop if we've reached checkpoint ID
+        if since_id and sid <= since_id:
+            print(f"  Firebase: reached checkpoint ID {since_id}")
+            break
+
+        story = await fetch_story_by_id(client, sid)
+        if story:
+            if story["time"] > since_time:
+                stories.append(story)
+            elif story["time"] <= since_time:
+                # Reached time boundary
+                print("  Firebase: reached time boundary")
+                break
+
+        await asyncio.sleep(0.05)
+
+    print(f"  Firebase: fetched {len(stories)} stories")
+    return stories, max_id_seen
+
+
+async def fetch_via_id_walk(
+    client: httpx.AsyncClient,
+    start_id: int,
+    since_time: int,
+    since_id: Optional[int],
+    on_progress=None,
+) -> list[dict]:
+    """
+    Walk backwards from start_id fetching stories until we reach since_time.
+    Slow but thorough fallback.
+    """
+    stories = []
+    current_id = start_id
+    consecutive_failures = 0
+    max_consecutive_failures = 100  # Stop if we hit too many non-stories in a row
+
+    print(f"  ID walk: starting from {start_id}...")
+
+    while consecutive_failures < max_consecutive_failures:
+        if since_id and current_id <= since_id:
+            print(f"  ID walk: reached checkpoint ID {since_id}")
+            break
+
+        story = await fetch_story_by_id(client, current_id)
+
+        if story:
+            consecutive_failures = 0
+            if story["time"] > since_time:
+                stories.append(story)
+                if len(stories) % 50 == 0:
+                    print(f"  ID walk: {len(stories)} stories so far...")
+            elif story["time"] <= since_time:
+                # We've gone past our time window
+                print(f"  ID walk: reached time boundary at ID {current_id}")
+                break
+        else:
+            consecutive_failures += 1
+
+        current_id -= 1
+        await asyncio.sleep(ID_WALK_DELAY)  # Rate limiting
+
+    if consecutive_failures >= max_consecutive_failures:
+        print(
+            f"  ID walk: stopped after {max_consecutive_failures} consecutive non-stories"
+        )
+
+    print(f"  ID walk: fetched {len(stories)} stories")
+    return stories
+
+
+async def fetch_new_stories(
+    db: Database,
+    lookback_hours: int = DEFAULT_LOOKBACK_HOURS,
+) -> int:
+    """
+    Fetch stories from checkpoint to now, oldest to newest.
+
+    - Checkpoint = MAX(time) from stories table (or now - lookback_hours if empty)
+    - Fetches in time windows, inserting as we go (crash-safe)
+    - Uses Algolia primarily, falls back to Firebase/ID-walk if needed
+    """
+    now = int(time.time())
+
+    # Get checkpoint from stories table
+    checkpoint_time = db.get_newest_story_time()
+    if checkpoint_time:
+        since_time = checkpoint_time
+        print(f"Resuming from checkpoint: {checkpoint_time}")
+    else:
+        since_time = now - (lookback_hours * 3600)
+        print(f"No stories found, looking back {lookback_hours} hours")
+
+    if since_time >= now:
+        print("Already up to date")
+        return 0
+
+    total_fetched = 0
+
+    async with httpx.AsyncClient() as client:
+        # Primary: Algolia (fetches oldest to newest via time windows)
+        print(f"Fetching stories from {since_time} to {now}...")
+        algolia_stories, algolia_ok = await fetch_via_algolia(client, since_time)
+
+        if algolia_stories:
+            # Sort oldest first and insert
+            algolia_stories.sort(key=lambda s: s["time"])
+            for story in algolia_stories:
+                db.upsert_story(story)
+            db.commit()
+            total_fetched += len(algolia_stories)
+            newest_time = max(s["time"] for s in algolia_stories)
+            print(
+                f"Algolia: inserted {len(algolia_stories)} stories, newest at {newest_time}"
+            )
+
+        # If Algolia failed, try Firebase for recent stories
+        if not algolia_ok:
+            print("Algolia failed, trying Firebase...")
+            firebase_stories, _ = await fetch_via_firebase_newstories(
+                client, since_time, since_id=None
+            )
+            if firebase_stories:
+                firebase_stories.sort(key=lambda s: s["time"])
+                for story in firebase_stories:
+                    db.upsert_story(story)
+                db.commit()
+                total_fetched += len(firebase_stories)
+                print(f"Firebase: inserted {len(firebase_stories)} stories")
+
+    print(f"Total: {total_fetched} stories fetched")
+    return total_fetched
+
+
+# =============================================================================
+# Content Extraction (Cloudflare Browser Rendering API)
+# =============================================================================
+
+# Global domain rate limiter (shared across all workers)
+domain_last_request: dict[str, float] = {}
+domain_lock = asyncio.Lock()
+
+# Global Cloudflare rate limit state (shared across all workers)
+cf_rate_limit_until: float = 0  # UTC timestamp when CF rate limit expires
+cf_rate_limit_lock = asyncio.Lock()
+
+# Blocking detection patterns
+BLOCKING_PATTERNS = [
+    r"captcha",
+    r"please verify",
+    r"access denied",
+    r"forbidden",
+    r"rate limit",
+    r"too many requests",
+    r"blocked",
+    r"unusual traffic",
+    r"security check",
+    r"ddos protection",
+    r"challenge-platform",
+    r"hcaptcha",
+    r"recaptcha",
+    r"just a moment",
+    r"checking your browser",
+    r"enable javascript",
+    r"redirecting",
+]
+BLOCKING_REGEX = re.compile("|".join(BLOCKING_PATTERNS), re.IGNORECASE)
+
+# Minimum content length to consider valid (very short = likely blocked)
+MIN_CONTENT_LENGTH = 200
+
+# Retry settings
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 30  # seconds, will exponentially increase
+
+
+async def wait_for_domain_rate_limit(domain: str):
+    """Wait if we've recently hit this domain."""
+    async with domain_lock:
+        now = time.time()
+        last_request = domain_last_request.get(domain, 0)
+        wait_time = DOMAIN_REQUEST_DELAY - (now - last_request)
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+        domain_last_request[domain] = time.time()
+
+
+@dataclass
+class FetchResult:
+    content: Optional[str]
+    status: str  # "done", "failed", "blocked", "timeout"
+    source: str  # "cloudflare"
+    browser_ms: float = 0
+    error: Optional[str] = None
+
+
+def detect_blocking(content: str) -> bool:
+    """Detect if content looks like a blocking/captcha page."""
+    if not content:
+        return False
+
+    # Very short content is suspicious
+    if len(content) < MIN_CONTENT_LENGTH:
+        if BLOCKING_REGEX.search(content):
+            return True
+        return False
+
+    # Check for blocking patterns in first part of content
+    first_chunk = content[:2000].lower()
+    if BLOCKING_REGEX.search(first_chunk):
+        if len(content) > 3000:
+            return False
+        return True
+
+    return False
+
+
+def get_next_utc_midnight() -> float:
+    """Get timestamp of next UTC midnight."""
+    now = datetime.now(timezone.utc)
+    # Tomorrow at 00:00:00 UTC
+    tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
+        days=1
+    )
+    return tomorrow.timestamp()
+
+
+async def fetch_content_cloudflare(url: str) -> FetchResult:
+    """Fetch content via Cloudflare Browser Rendering API (returns markdown)."""
+    global cf_quota_exceeded_until
+
+    # Check if we're in quota exceeded state
+    if cf_quota_exceeded_until > 0 and time.time() < cf_quota_exceeded_until:
+        return FetchResult(
+            None,
+            "quota_exceeded",
+            "cloudflare",
+            0,
+            "Daily quota exceeded, waiting for reset",
+        )
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                CF_BROWSER_API,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {CF_API_TOKEN}",
+                },
+                json={
+                    "url": url,
+                    "gotoOptions": {
+                        "timeout": cf_timeout_ms,
+                    },
+                },
+                timeout=60,
+            )
+
+            if resp.status_code == 429:
+                # Check if it's daily quota exceeded vs rate limit
+                try:
+                    data = resp.json()
+                    errors = data.get("errors", [])
+                    error_msg = str(errors)
+                    if "time limit exceeded for today" in error_msg.lower():
+                        cf_quota_exceeded_until = get_next_utc_midnight()
+                        print(
+                            "  [cloudflare] Daily quota exceeded, pausing until UTC midnight"
+                        )
+                        return FetchResult(
+                            None,
+                            "quota_exceeded",
+                            "cloudflare",
+                            0,
+                            "Daily quota exceeded",
+                        )
+                except Exception:
+                    pass
+                # Regular rate limit - check Retry-After header
+                retry_after = resp.headers.get("Retry-After", "60")
+                return FetchResult(
+                    None,
+                    "rate_limited",
+                    "cloudflare",
+                    0,
+                    f"Rate limited, retry after {retry_after}s",
+                )
+
+            if resp.status_code != 200:
+                return FetchResult(
+                    None, "failed", "cloudflare", 0, f"HTTP {resp.status_code}"
+                )
+
+            data = resp.json()
+            if not data.get("success"):
+                errors = data.get("errors", [])
+                return FetchResult(None, "failed", "cloudflare", 0, str(errors))
+
+            content = data.get("result", "")
+            browser_ms = float(resp.headers.get("x-browser-ms-used", 0))
+
+            if not content or len(content.strip()) < 50:
+                return FetchResult(
+                    None, "failed", "cloudflare", browser_ms, "Empty content"
+                )
+
+            if detect_blocking(content):
+                return FetchResult(
+                    content, "blocked", "cloudflare", browser_ms, "Blocking detected"
+                )
+
+            return FetchResult(content, "done", "cloudflare", browser_ms)
+
+    except httpx.TimeoutException:
+        return FetchResult(None, "timeout", "cloudflare", 0, "Request timed out")
+    except Exception as e:
+        return FetchResult(None, "failed", "cloudflare", 0, str(e))
+
+
+async def fetch_content(url: str) -> FetchResult:
+    """Fetch content via Cloudflare Browser Rendering API."""
+    return await fetch_content_cloudflare(url)
+
+
+async def content_worker(worker_id: int, db: Database, stop_event: asyncio.Event):
+    """
+    Content worker that fetches article content for stories.
+    Multiple workers can run concurrently - uses atomic job claiming and
+    shared rate limit state to coordinate.
+    """
+    global cf_rate_limit_until
+    print(f"  [worker-{worker_id}] started")
+
+    while not stop_event.is_set():
+        # Check global CF rate limit (shared across all workers)
+        # Reading a float is atomic; lock only needed for writes
+        now = time.time()
+        if cf_rate_limit_until > now:
+            wait_time = cf_rate_limit_until - now
+            print(
+                f"  [worker-{worker_id}] CF rate limited, waiting {wait_time:.0f}s..."
+            )
+            await asyncio.sleep(min(wait_time, 30))
+            continue
+
+        # Check daily quota exceeded (Free plan only)
+        if cf_quota_exceeded_until > now:
+            await asyncio.sleep(60)  # Check every minute
+            continue
+
+        # Atomically claim next job (safe for multiple workers)
+        job = db.claim_next_content_job(max_attempts=MAX_RETRIES)
+        if not job:
+            await asyncio.sleep(5)  # No work, wait before checking again
+            continue
+
+        story_id = job["id"]
+        url = job["url"]
+        domain = job.get("domain") or extract_domain(url)
+        attempts = job["content_attempts"]
+
+        # Check cache first (avoid fetching same URL twice)
+        cached = db.get_cached_content(url)
+        if cached:
+            db.complete_content_job(
+                story_id,
+                cached["content"],
+                "done",
+                cached["source"],
+                cached["browser_ms"],
+            )
+            print(f"  [worker-{worker_id}] cached {story_id} ({domain})")
+            continue
+
+        # Wait for domain rate limit (shared across all workers)
+        # This ensures we don't hammer the same domain from multiple workers
+        await wait_for_domain_rate_limit(domain)
+
+        # Fetch content
+        result = await fetch_content(url)
+
+        if result.status == "done":
+            db.cache_content(url, result.content, result.source, result.browser_ms)
+            db.complete_content_job(
+                story_id, result.content, "done", result.source, result.browser_ms
+            )
+            db.log_usage(story_id, url, result.browser_ms, result.source)
+            print(
+                f"  [worker-{worker_id}] done {story_id} ({domain}) [{result.browser_ms:.0f}ms]"
+            )
+
+        elif result.status == "blocked":
+            if attempts >= MAX_RETRIES:
+                db.complete_content_job(
+                    story_id,
+                    result.content or "",
+                    "blocked",
+                    result.source,
+                    result.browser_ms,
+                )
+                if result.browser_ms > 0:
+                    db.log_usage(story_id, url, result.browser_ms, result.source)
+                print(
+                    f"  [worker-{worker_id}] BLOCKED {story_id} ({domain}) after {attempts} attempts"
+                )
+            else:
+                db.retry_content_job(story_id)
+                print(
+                    f"  [worker-{worker_id}] blocked {story_id} ({domain}), attempt {attempts}/{MAX_RETRIES}"
+                )
+
+        elif result.status == "timeout":
+            if attempts >= MAX_RETRIES:
+                db.complete_content_job(story_id, "", "failed", result.source)
+                print(
+                    f"  [worker-{worker_id}] FAILED {story_id} ({domain}) - timeouts after {attempts} attempts"
+                )
+            else:
+                db.retry_content_job(story_id)
+                print(
+                    f"  [worker-{worker_id}] timeout {story_id} ({domain}), attempt {attempts}/{MAX_RETRIES}"
+                )
+
+        elif result.status == "quota_exceeded":
+            # Daily quota exceeded (Free plan) - put back and wait
+            db.retry_content_job(story_id)
+            print(f"  [worker-{worker_id}] Quota exceeded, waiting for UTC midnight...")
+            await asyncio.sleep(60)
+
+        elif result.status == "rate_limited":
+            # Rate limited by CF - put back and set global delay
+            db.retry_content_job(story_id)
+            delay = 60  # default
+            if result.error and "retry after" in result.error.lower():
+                try:
+                    delay = int(result.error.split()[-1].rstrip("s"))
+                except (ValueError, IndexError):
+                    pass
+            async with cf_rate_limit_lock:
+                cf_rate_limit_until = time.time() + delay
+            print(
+                f"  [worker-{worker_id}] CF rate limited, all workers waiting {delay}s..."
+            )
+
+        else:
+            # Other failure
+            if attempts >= MAX_RETRIES:
+                db.complete_content_job(story_id, "", "failed", result.source)
+                print(
+                    f"  [worker-{worker_id}] FAILED {story_id} ({domain}) - {result.error}"
+                )
+            else:
+                db.retry_content_job(story_id)
+                print(
+                    f"  [worker-{worker_id}] failed {story_id} ({domain}), attempt {attempts}/{MAX_RETRIES}: {result.error}"
+                )
+
+    print(f"  [worker-{worker_id}] stopped")
+
+
+async def story_fetcher(
+    db: Database, stop_event: asyncio.Event, interval_minutes: int = 60
+):
+    """Background task that fetches new stories on a schedule."""
+    print(f"Story fetcher started (interval: {interval_minutes}m)")
+
+    # Fetch immediately on start
+    print("  [fetcher] Initial fetch...")
+    try:
+        count = await fetch_new_stories(db)
+        print(f"  [fetcher] Initial fetch complete: {count} stories")
+    except Exception as e:
+        print(f"  [fetcher] Initial fetch error: {e}")
+
+    # Schedule subsequent fetches on the hour
+    while not stop_event.is_set():
+        # Calculate time until next interval
+        now = datetime.now()
+        # Next run at the top of the next interval
+        minutes_until_next = interval_minutes - (now.minute % interval_minutes)
+        if minutes_until_next == interval_minutes and now.second == 0:
+            minutes_until_next = 0
+        seconds_until_next = minutes_until_next * 60 - now.second
+
+        if seconds_until_next > 0:
+            print(
+                f"  [fetcher] Next fetch in {seconds_until_next // 60}m {seconds_until_next % 60}s"
+            )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=seconds_until_next)
+                break  # Stop event was set
+            except asyncio.TimeoutError:
+                pass  # Time to fetch
+
+        if stop_event.is_set():
+            break
+
+        print(
+            f"  [fetcher] Scheduled fetch at {datetime.now().strftime('%H:%M:%S')}..."
+        )
+        try:
+            count = await fetch_new_stories(db)
+            print(f"  [fetcher] Fetched {count} new stories")
+        except Exception as e:
+            print(f"  [fetcher] Fetch error: {e}")
+
+    print("Story fetcher stopped")
+
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
+
+# Global state
+db: Database = None
+content_workers: list[asyncio.Task] = []
+story_fetcher_task: asyncio.Task = None
+stop_event: asyncio.Event = None
+fetch_status: dict = {"status": "idle", "progress": 0, "total": 0, "fetched": 0}
+cf_quota_exceeded_until: float = 0  # UTC timestamp when quota resets (0 = not exceeded)
+cf_timeout_ms: int = CF_BROWSER_TIMEOUT_MS  # Configurable via --cf-timeout
+
+# Content worker configuration
+# Paid plan: up to 180 req/min from CF, but domain rate limiting (2s/domain) is the real limit
+# Multiple workers help when fetching from many different domains
+DEFAULT_CONTENT_WORKERS = 3
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db, content_workers, stop_event, story_fetcher_task
+
+    # Initialize
+    db = Database(DB_FILE)
+    db.init()
+    stop_event = asyncio.Event()
+
+    # Start story fetcher (background, non-blocking)
+    # Fetches immediately then on schedule
+    story_fetcher_task = asyncio.create_task(
+        story_fetcher(db, stop_event, app.state.fetch_interval)
+    )
+
+    # Start content workers
+    # Multiple workers can run concurrently - they coordinate via:
+    # - Atomic job claiming (UPDATE...RETURNING)
+    # - Shared domain rate limiter (2s between requests to same domain)
+    # - Shared CF rate limit state (all workers pause if CF returns 429)
+    num_workers = app.state.num_workers
+    for i in range(num_workers):
+        task = asyncio.create_task(content_worker(i + 1, db, stop_event))
+        content_workers.append(task)
+    print(f"Started {num_workers} content worker(s)")
+
+    print(f"Server ready - http://127.0.0.1:{app.state.port}")
+
+    yield
+
+    # Shutdown
+    print("\nShutting down...")
+    stop_event.set()
+
+    # Cancel story fetcher
+    if story_fetcher_task:
+        story_fetcher_task.cancel()
+        try:
+            await story_fetcher_task
+        except asyncio.CancelledError:
+            pass
+
+    # Cancel content workers
+    for task in content_workers:
+        task.cancel()
+    await asyncio.gather(*content_workers, return_exceptions=True)
+    print("Shutdown complete")
+
+
+app = FastAPI(lifespan=lifespan)
+app.state.fetch_interval = FETCH_INTERVAL_MINUTES
+app.state.port = 8000
+app.state.num_workers = DEFAULT_CONTENT_WORKERS
+app.state.auth_user = None
+app.state.auth_pass = None
+
+
+# Basic auth middleware
+class BasicAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Skip auth if not configured
+        if not app.state.auth_user or not app.state.auth_pass:
+            return await call_next(request)
+
+        # Check Authorization header
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Basic "):
+            try:
+                credentials = base64.b64decode(auth_header[6:]).decode("utf-8")
+                username, password = credentials.split(":", 1)
+                # Use constant-time comparison to prevent timing attacks
+                if secrets.compare_digest(
+                    username, app.state.auth_user
+                ) and secrets.compare_digest(password, app.state.auth_pass):
+                    return await call_next(request)
+            except Exception:
+                pass
+
+        # Request authentication
+        return Response(
+            content="Authentication required",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="HN New"'},
+        )
+
+
+app.add_middleware(BasicAuthMiddleware)
+
+
+# Serve frontend static files (from directory or zip)
+# Custom handler to serve from zip file
+class ZipStaticFiles:
+    def __init__(self, zip_path: Path):
+        self.zip_path = zip_path
+        self._zip = None
+
+    def _get_zip(self):
+        if self._zip is None:
+            self._zip = zipfile.ZipFile(self.zip_path, "r")
+        return self._zip
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return
+        path = scope["path"].lstrip("/static/")
+        if not path:
+            path = "index.html"
+
+        try:
+            zf = self._get_zip()
+            content = zf.read(path)
+
+            # Determine content type
+            content_type = "application/octet-stream"
+            if path.endswith(".html"):
+                content_type = "text/html; charset=utf-8"
+            elif path.endswith(".css"):
+                content_type = "text/css; charset=utf-8"
+            elif path.endswith(".js"):
+                content_type = "application/javascript; charset=utf-8"
+            elif path.endswith(".json"):
+                content_type = "application/json"
+            elif path.endswith(".png"):
+                content_type = "image/png"
+            elif path.endswith(".svg"):
+                content_type = "image/svg+xml"
+
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [[b"content-type", content_type.encode()]],
+                }
+            )
+            await send({"type": "http.response.body", "body": content})
+        except KeyError:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 404,
+                    "headers": [[b"content-type", b"text/plain"]],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"Not found"})
+
+
+# Prefer directory, fall back to zip
+if FRONTEND_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+    templates = Jinja2Templates(directory=str(FRONTEND_DIR))
+elif FRONTEND_ZIP.exists():
+    app.mount("/static", ZipStaticFiles(FRONTEND_ZIP))
+    # For templates, extract index.html to temp location
+    _temp_dir = tempfile.mkdtemp()
+    with zipfile.ZipFile(FRONTEND_ZIP, "r") as zf:
+        zf.extract("index.html", _temp_dir)
+    templates = Jinja2Templates(directory=_temp_dir)
+else:
+    templates = None
+    print("WARNING: No frontend found (neither frontend/ dir nor ui.zip)")
+
+
+# --- HTML Routes ---
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    if templates is None:
+        return HTMLResponse(
+            "<h1>Frontend not found</h1><p>Create frontend/ directory or provide ui.zip</p>"
+        )
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+# --- API Routes ---
+
+
+@app.get("/api/stories")
+async def get_stories(
+    include_dismissed: bool = False,
+    include_blocked: bool = False,
+    read_later_only: bool = False,
+):
+    if read_later_only:
+        return db.get_read_later()
+    return db.get_stories(include_dismissed, include_blocked)
+
+
+@app.get("/api/story/{story_id}")
+async def get_story(story_id: int):
+    row = db.fetchone("SELECT * FROM stories WHERE id = ?", (story_id,))
+    if not row:
+        raise HTTPException(404, "Story not found")
+    return dict(row)
+
+
+@app.get("/api/story/{story_id}/content")
+async def get_story_content(story_id: int):
+    row = db.fetchone(
+        "SELECT content, content_status FROM stories WHERE id = ?", (story_id,)
+    )
+    if not row:
+        raise HTTPException(404, "Story not found")
+    return {"content": row["content"], "status": row["content_status"]}
+
+
+@app.post("/api/story/{story_id}/opened")
+async def mark_story_opened(story_id: int):
+    db.add_to_history(story_id)
+    return {"ok": True}
+
+
+# --- Blocked domains ---
+
+
+@app.get("/api/blocked/domains")
+async def get_blocked_domains():
+    return db.get_blocked_domains()
+
+
+@app.post("/api/blocked/domains")
+async def add_blocked_domain(domain: str = Query(...)):
+    db.add_blocked_domain(domain)
+    return {"ok": True}
+
+
+@app.delete("/api/blocked/domains")
+async def remove_blocked_domain(domain: str = Query(...)):
+    db.remove_blocked_domain(domain)
+    return {"ok": True}
+
+
+# --- Blocked words ---
+
+
+@app.get("/api/blocked/words")
+async def get_blocked_words():
+    return db.get_blocked_words()
+
+
+@app.post("/api/blocked/words")
+async def add_blocked_word(word: str = Query(...)):
+    db.add_blocked_word(word)
+    return {"ok": True}
+
+
+@app.delete("/api/blocked/words")
+async def remove_blocked_word(word: str = Query(...)):
+    db.remove_blocked_word(word)
+    return {"ok": True}
+
+
+# --- Merit words ---
+
+
+@app.get("/api/merit/words")
+async def get_merit_words():
+    return db.get_merit_words()
+
+
+@app.post("/api/merit/words")
+async def add_merit_word(word: str = Query(...), weight: int = Query(1)):
+    db.add_merit_word(word, weight)
+    return {"ok": True}
+
+
+@app.delete("/api/merit/words")
+async def remove_merit_word(word: str = Query(...)):
+    db.remove_merit_word(word)
+    return {"ok": True}
+
+
+# --- Demerit words ---
+
+
+@app.get("/api/demerit/words")
+async def get_demerit_words():
+    return db.get_demerit_words()
+
+
+@app.post("/api/demerit/words")
+async def add_demerit_word(word: str = Query(...), weight: int = Query(1)):
+    db.add_demerit_word(word, weight)
+    return {"ok": True}
+
+
+@app.delete("/api/demerit/words")
+async def remove_demerit_word(word: str = Query(...)):
+    db.remove_demerit_word(word)
+    return {"ok": True}
+
+
+# --- Merit domains ---
+
+
+@app.get("/api/merit/domains")
+async def get_merit_domains():
+    return db.get_merit_domains()
+
+
+@app.post("/api/merit/domains")
+async def add_merit_domain(domain: str = Query(...), weight: int = Query(1)):
+    db.add_merit_domain(domain, weight)
+    return {"ok": True}
+
+
+@app.delete("/api/merit/domains")
+async def remove_merit_domain(domain: str = Query(...)):
+    db.remove_merit_domain(domain)
+    return {"ok": True}
+
+
+# --- Demerit domains ---
+
+
+@app.get("/api/demerit/domains")
+async def get_demerit_domains():
+    return db.get_demerit_domains()
+
+
+@app.post("/api/demerit/domains")
+async def add_demerit_domain(domain: str = Query(...), weight: int = Query(1)):
+    db.add_demerit_domain(domain, weight)
+    return {"ok": True}
+
+
+@app.delete("/api/demerit/domains")
+async def remove_demerit_domain(domain: str = Query(...)):
+    db.remove_demerit_domain(domain)
+    return {"ok": True}
+
+
+# --- Read later ---
+
+
+@app.get("/api/readlater")
+async def get_read_later():
+    return db.get_read_later()
+
+
+@app.post("/api/readlater/{story_id}")
+async def add_read_later(story_id: int):
+    db.add_read_later(story_id)
+    return {"ok": True}
+
+
+@app.delete("/api/readlater/{story_id}")
+async def remove_read_later(story_id: int):
+    db.remove_read_later(story_id)
+    return {"ok": True}
+
+
+# --- Dismissed ---
+
+
+@app.post("/api/dismiss/{story_id}")
+async def dismiss_story(story_id: int):
+    db.dismiss_story(story_id)
+    return {"ok": True}
+
+
+@app.delete("/api/dismiss/{story_id}")
+async def undismiss_story(story_id: int):
+    db.undismiss_story(story_id)
+    return {"ok": True}
+
+
+@app.delete("/api/dismiss")
+async def clear_dismissed():
+    db.clear_dismissed()
+    return {"ok": True}
+
+
+# --- Stats and Status ---
+
+
+@app.get("/api/stats")
+async def get_stats():
+    return db.get_stats()
+
+
+@app.get("/api/usage")
+async def get_usage():
+    """Get Cloudflare browser rendering usage statistics."""
+    return db.get_usage_stats()
+
+
+@app.get("/api/status")
+async def get_status():
+    quota_info = None
+    if cf_quota_exceeded_until > 0:
+        remaining = cf_quota_exceeded_until - time.time()
+        if remaining > 0:
+            quota_info = {
+                "exceeded": True,
+                "resets_in_seconds": int(remaining),
+            }
+    return {
+        "fetch": fetch_status,
+        "workers": len(content_workers),
+        "cf_quota": quota_info,
+        "cf_timeout_ms": cf_timeout_ms,
+    }
+
+
+@app.post("/api/fetch")
+async def trigger_fetch():
+    """Trigger a fetch of new stories (fetches all back to checkpoint)."""
+    global fetch_status
+
+    if fetch_status["status"] == "fetching":
+        return {"ok": False, "error": "Already fetching"}
+
+    fetch_status = {"status": "fetching", "progress": 0, "total": 0, "fetched": 0}
+
+    try:
+        fetched = await fetch_new_stories(db)
+        fetch_status = {"status": "done", "progress": 0, "total": 0, "fetched": fetched}
+        return {"ok": True, "fetched": fetched}
+    except Exception as e:
+        fetch_status = {"status": "error", "error": str(e)}
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/batch")
+async def batch_requests(request: Request):
+    """Process multiple API requests in a single call (for UI batching)."""
+    try:
+        body = await request.json()
+        requests_list = body.get("requests", [])
+
+        for req in requests_list:
+            method = req.get("method", "").upper()
+            path = req.get("path", "")
+
+            # Route to appropriate handler based on path pattern
+            if path.startswith("/api/dismiss/") and method == "POST":
+                story_id = int(path.split("/")[-1])
+                db.dismiss_story(story_id)
+            elif path.startswith("/api/readlater/"):
+                story_id = int(path.split("/")[-1])
+                if method == "POST":
+                    db.add_read_later(story_id)
+                elif method == "DELETE":
+                    db.remove_read_later(story_id)
+            elif path.startswith("/api/blocked/domains") and method == "POST":
+                # Parse domain from query string
+                if "domain=" in path:
+                    domain = path.split("domain=")[-1].split("&")[0]
+                    from urllib.parse import unquote
+
+                    db.add_blocked_domain(unquote(domain))
+
+        return {"ok": True, "processed": len(requests_list)}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/stories/updates")
+async def get_story_updates():
+    """Get stories with recently updated content (for efficient polling)."""
+    # Return stories updated in the last minute with content
+    rows = db.fetchall("""
+        SELECT id, title, content, content_status,
+               SUBSTR(content, 1, 300) as teaser
+        FROM stories
+        WHERE content_status IN ('done', 'blocked', 'failed')
+          AND updated_at >= datetime('now', '-60 seconds')
+        ORDER BY updated_at DESC
+        LIMIT 50
+    """)
+    result = []
+    for row in rows:
+        story = dict(row)
+        if story.get("teaser"):
+            teaser = story["teaser"].strip()
+            if len(story.get("content", "")) > 300:
+                teaser += "..."
+            story["teaser"] = teaser
+        result.append(story)
+    return result
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
+async def main_async(args):
+    global db
+
+    # Validate Cloudflare credentials
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        print("WARNING: CF_ACCOUNT_ID and CF_API_TOKEN not set!")
+        print("Content extraction will not work. Set these in .env file.")
+        print()
+
+    # Initialize DB
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    db = Database(DB_FILE)
+    db.init()
+
+    # Handle reset - clears all stories to start fresh
+    if args.reset:
+        db.execute("DELETE FROM stories")
+        db.execute("DELETE FROM fetched_urls")
+        db.execute("DELETE FROM usage_log")
+        db.execute("DELETE FROM dismissed")
+        db.execute("DELETE FROM history")
+        db.commit()
+        print(
+            "Reset complete - all stories cleared. Next fetch will look back from now."
+        )
+        return
+
+    # Configure app state
+    app.state.fetch_interval = args.fetch_interval
+    app.state.port = args.port
+    app.state.num_workers = args.num_workers
+    app.state.auth_user = args.user
+    app.state.auth_pass = args.password
+    app.state.cf_timeout = min(args.cf_timeout, 60000)  # Cap at 60s (CF max)
+
+    # Set global for use in fetch function
+    global cf_timeout_ms
+    cf_timeout_ms = app.state.cf_timeout
+
+    # Start server
+    host = "0.0.0.0" if args.public else "127.0.0.1"
+    print(f"Starting server on http://{host}:{args.port}")
+    if args.user:
+        print(f"Basic auth enabled (user: {args.user})")
+    print("Press Ctrl+C to stop\n")
+
+    import uvicorn
+
+    config = uvicorn.Config(app, host=host, port=args.port, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="HN New Story Browser")
+    parser.add_argument("--port", type=int, default=8000, help="Server port")
+    parser.add_argument(
+        "--public", action="store_true", help="Bind to 0.0.0.0 (all interfaces)"
+    )
+    parser.add_argument(
+        "--reset", action="store_true", help="Reset checkpoint to now (fetch nothing)"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=f"Number of content workers (default: {DEFAULT_CONTENT_WORKERS})",
+    )
+    args = parser.parse_args()
+
+    # All config from env (see .env.example)
+    args.user = os.environ.get("HN_USER")
+    args.password = os.environ.get("HN_PASSWORD")
+    args.fetch_interval = int(
+        os.environ.get("HN_FETCH_INTERVAL", FETCH_INTERVAL_MINUTES)
+    )
+    args.cf_timeout = min(
+        int(os.environ.get("CF_BROWSER_TIMEOUT_MS", CF_BROWSER_TIMEOUT_MS)), 60000
+    )
+    # Worker count: CLI arg > env var > default
+    if args.workers is not None:
+        args.num_workers = args.workers
+    else:
+        args.num_workers = int(
+            os.environ.get("HN_CONTENT_WORKERS", DEFAULT_CONTENT_WORKERS)
+        )
+
+    asyncio.run(main_async(args))
+
+
+if __name__ == "__main__":
+    main()

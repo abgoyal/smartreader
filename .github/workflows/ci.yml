@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Lint Python
+        run: uvx ruff check hn_new.py
+
+      - name: Check Python formatting
+        run: uvx ruff format --check hn_new.py
+
+      - name: Verify Python syntax
+        run: python3 -m py_compile hn_new.py

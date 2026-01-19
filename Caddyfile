@@ -1,0 +1,39 @@
+# Caddy reverse proxy configuration for HN New
+#
+# Caddy automatically handles Let's Encrypt SSL certificates.
+# Just point your subdomain DNS to this server and Caddy does the rest.
+#
+# Usage:
+#   1. Install Caddy: https://caddyserver.com/docs/install
+#   2. Update the domain below to your subdomain
+#   3. Run: caddy run --config Caddyfile
+#
+# Or as a systemd service:
+#   sudo cp Caddyfile /etc/caddy/Caddyfile
+#   sudo systemctl restart caddy
+
+# Replace with your actual subdomain
+hn.yourdomain.com {
+    # Reverse proxy to the Python app
+    reverse_proxy localhost:8000
+
+    # Optional: Add request logging
+    log {
+        output file /var/log/caddy/hn.log
+    }
+
+    # Optional: Compress responses
+    encode gzip
+}
+
+# Alternative: If you want Caddy to handle basic auth instead of the app
+# (comment out the above and use this instead)
+#
+# hn.yourdomain.com {
+#     basicauth {
+#         # Generate hash with: caddy hash-password
+#         your_username $2a$14$your_hashed_password_here
+#     }
+#     reverse_proxy localhost:8000
+#     encode gzip
+# }

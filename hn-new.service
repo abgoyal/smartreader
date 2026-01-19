@@ -1,0 +1,58 @@
+# systemd service file for HN New
+#
+# Directory structure on server:
+#   /opt/hn-new/
+#   ├── hn_new.py      # Main script
+#   ├── ui.zip         # Frontend assets
+#   ├── .env           # Secrets (CF_ACCOUNT_ID, CF_API_TOKEN, HN_USER, HN_PASSWORD)
+#   └── .hn_data/      # SQLite database (created automatically)
+#
+# Installation:
+#   1. Create directory and copy files:
+#      sudo mkdir -p /opt/hn-new
+#      sudo chown www-data:www-data /opt/hn-new
+#      scp hn_new.py ui.zip .env.example user@server:/opt/hn-new/
+#
+#   2. Create .env file with your credentials:
+#      sudo -u www-data cp /opt/hn-new/.env.example /opt/hn-new/.env
+#      sudo -u www-data nano /opt/hn-new/.env
+#      # Fill in: CF_ACCOUNT_ID, CF_API_TOKEN, HN_USER, HN_PASSWORD
+#      sudo chmod 600 /opt/hn-new/.env
+#
+#   3. Install uv on server:
+#      curl -LsSf https://astral.sh/uv/install.sh | sh
+#
+#   4. Copy and enable service:
+#      sudo cp hn-new.service /etc/systemd/system/
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now hn-new
+#
+#   5. Check status/logs:
+#      sudo systemctl status hn-new
+#      sudo journalctl -u hn-new -f
+
+[Unit]
+Description=HN New Story Browser
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/hn-new
+
+# The .env file in WorkingDirectory is loaded by the app itself
+ExecStart=/usr/local/bin/uv run --script /opt/hn-new/hn_new.py --public
+
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/hn-new
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

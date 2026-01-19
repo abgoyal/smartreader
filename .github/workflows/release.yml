@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build ui.zip
+        run: |
+          cd frontend
+          zip -r ../ui.zip index.html app.js style.css manifest.json icon.svg sw.js
+          cd ..
+
+      - name: Create release archive
+        run: |
+          # Create release directory
+          mkdir -p release
+          cp hn_new.py release/
+          cp ui.zip release/
+          cp .env.example release/
+          cp README.md release/
+          cp Caddyfile release/
+          cp hn-new.service release/
+
+          # Create the release zip
+          cd release
+          zip -r ../hn-new-${{ github.ref_name }}.zip .
+          cd ..
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            hn-new-${{ github.ref_name }}.zip
+            hn_new.py
+            ui.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

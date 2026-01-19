@@ -1,0 +1,42 @@
+{
+  "name": "HN New",
+  "short_name": "HN New",
+  "description": "Personal HackerNews story browser with content extraction",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#fdf6e3",
+  "theme_color": "#268bd2",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/static/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "categories": ["news", "productivity"],
+  "screenshots": [],
+  "shortcuts": [
+    {
+      "name": "All Stories",
+      "url": "/?view=all",
+      "description": "View all stories"
+    },
+    {
+      "name": "Read Later",
+      "url": "/?view=readlater",
+      "description": "View saved stories"
+    }
+  ]
+}

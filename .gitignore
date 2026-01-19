@@ -1,0 +1,31 @@
+# Environment and secrets
+.env
+
+# Data directory
+.hn_data/
+
+# Build artifacts
+ui.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.ruff_cache/
+.claude/
