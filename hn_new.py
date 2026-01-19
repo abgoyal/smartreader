@@ -58,12 +58,97 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
-# Set up logging with timestamps
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
+
+# Set up logging with timestamps, colors, and aligned prefixes
+class ColoredFormatter(logging.Formatter):
+    """Formatter with colored levels and source prefixes."""
+
+    LEVEL_COLORS = {
+        "DEBUG": "\033[36m",  # Cyan
+        "INFO": "\033[32m",  # Green
+        "WARNING": "\033[33m",  # Yellow
+        "ERROR": "\033[31m",  # Red
+        "CRITICAL": "\033[35m",  # Magenta
+    }
+    PREFIX_COLORS = {
+        "http": "\033[34m",  # Blue
+        "fetch": "\033[34m",  # Blue (outgoing requests)
+        "fetcher": "\033[35m",  # Magenta
+        "worker": "\033[36m",  # Cyan
+        "front-page": "\033[33m",  # Yellow
+    }
+    RESET = "\033[0m"
+    PREFIX_WIDTH = 10  # Fixed width for alignment
+
+    def format(self, record):
+        # Color the level
+        level_color = self.LEVEL_COLORS.get(record.levelname, "")
+        colored_level = f"{level_color}{record.levelname:<7}{self.RESET}"
+
+        # Determine prefix from logger name or message
+        prefix = self._extract_prefix(record)
+        prefix_color = self._get_prefix_color(prefix)
+        # Brackets enclose the padded prefix: [prefix    ]
+        colored_prefix = f"{prefix_color}[{prefix:<{self.PREFIX_WIDTH}}]{self.RESET}"
+
+        # Clean message (remove prefix if it was in message)
+        msg = self._clean_message(record.getMessage(), prefix)
+
+        # Format timestamp
+        timestamp = self.formatTime(record, self.datefmt)
+
+        return f"{timestamp} {colored_level} {colored_prefix} {msg}"
+
+    def _extract_prefix(self, record):
+        """Extract prefix from logger name or message."""
+        # Check logger name first
+        if record.name.startswith("uvicorn"):
+            return "http"
+        if record.name.startswith("httpx"):
+            return "fetch"
+
+        # Check if message starts with [prefix]
+        msg = record.getMessage()
+        if msg.startswith("["):
+            end = msg.find("]")
+            if end > 0:
+                return msg[1:end]
+
+        return "main"
+
+    def _get_prefix_color(self, prefix):
+        """Get color for a prefix."""
+        for key, color in self.PREFIX_COLORS.items():
+            if key in prefix.lower():
+                return color
+        return ""
+
+    def _clean_message(self, msg, prefix):
+        """Remove prefix from message if present."""
+        tag = f"[{prefix}]"
+        if msg.startswith(tag):
+            return msg[len(tag) :].lstrip()
+        return msg
+
+
+def setup_logging():
+    """Configure logging for the application and uvicorn."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(ColoredFormatter(datefmt="%H:%M:%S"))
+
+    # Configure root logger
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers = [handler]
+
+    # Configure uvicorn and httpx loggers to use same format
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error", "httpx"):
+        logger = logging.getLogger(name)
+        logger.handlers = [handler]
+        logger.propagate = False
+
+
+setup_logging()
 log = logging.getLogger("hn_new")
 
 # =============================================================================
@@ -2205,7 +2290,9 @@ async def main_async(args):
 
     import uvicorn
 
-    config = uvicorn.Config(app, host=host, port=args.port, log_level="info")
+    config = uvicorn.Config(
+        app, host=host, port=args.port, log_level="info", log_config=None
+    )
     server = uvicorn.Server(config)
     await server.serve()
 
