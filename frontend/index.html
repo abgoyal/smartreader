@@ -39,11 +39,37 @@
                 <div id="filter-status">Showing all</div>
             </div>
 
+            <div id="sidebar-controls">
+                <label><input type="checkbox" id="show-dismissed"> Dismissed</label>
+                <label><input type="checkbox" id="show-blocked"> Blocked</label>
+                <label><input type="checkbox" id="front-page-only"> Front page only</label>
+                <label><input type="checkbox" id="sort-oldest" checked> Oldest first</label>
+                <button id="btn-refresh" title="Fetch new stories (F)">Refresh</button>
+            </div>
+
+            <div id="sidebar-cf-stats">
+                <div class="cf-stats-label">CF Today</div>
+                <div id="cf-stats-value">--</div>
+            </div>
+
             <div class="sidebar-shortcuts">
-                <kbd>j</kbd>/<kbd>k</kbd> nav
-                <kbd>o</kbd> open
-                <kbd>e</kbd> expand
-                <kbd>?</kbd> help
+                <span class="shortcut-hint"><kbd>j</kbd>/<kbd>k</kbd> nav · <kbd>o</kbd> open · <kbd>?</kbd> help</span>
+            </div>
+
+            <div id="shortcuts-help" class="hidden">
+                <h4>Keyboard Shortcuts</h4>
+                <ul>
+                    <li><kbd>j</kbd> / <kbd>k</kbd> - Down / Up</li>
+                    <li><kbd>o</kbd> - Open story link</li>
+                    <li><kbd>Enter</kbd> - Open HN comments</li>
+                    <li><kbd>e</kbd> - Expand/collapse content</li>
+                    <li><kbd>r</kbd> - Toggle read later</li>
+                    <li><kbd>d</kbd> - Dismiss story</li>
+                    <li><kbd>b</kbd> - Block domain</li>
+                    <li><kbd>f</kbd> - Fetch new stories</li>
+                    <li><kbd>1-3</kbd> - Switch views</li>
+                    <li><kbd>?</kbd> - Toggle this help</li>
+                </ul>
             </div>
         </aside>
 
@@ -51,18 +77,6 @@
         <main>
             <!-- Stories View -->
             <section id="view-all" class="view active">
-                <div id="controls">
-                    <label>
-                        <input type="checkbox" id="show-dismissed"> Show dismissed
-                    </label>
-                    <label>
-                        <input type="checkbox" id="show-blocked"> Show blocked
-                    </label>
-                    <label>
-                        <input type="checkbox" id="sort-oldest" checked> Oldest first
-                    </label>
-                    <button id="btn-refresh" title="Fetch new stories (F)">Refresh</button>
-                </div>
                 <ul id="story-list"></ul>
             </section>
 
@@ -161,23 +175,6 @@
 
     <!-- Toast -->
     <div id="toast"></div>
-
-    <!-- Keyboard shortcuts help -->
-    <div id="shortcuts-help" class="hidden">
-        <h4>Keyboard Shortcuts</h4>
-        <ul>
-            <li><kbd>j</kbd> / <kbd>k</kbd> - Up / Down</li>
-            <li><kbd>o</kbd> - Open story link</li>
-            <li><kbd>Enter</kbd> - Open HN comments</li>
-            <li><kbd>e</kbd> - Expand/collapse content</li>
-            <li><kbd>r</kbd> - Toggle read later</li>
-            <li><kbd>d</kbd> - Dismiss story</li>
-            <li><kbd>b</kbd> - Block domain</li>
-            <li><kbd>f</kbd> - Fetch new stories</li>
-            <li><kbd>1-3</kbd> - Switch views</li>
-            <li><kbd>?</kbd> - Toggle this help</li>
-        </ul>
-    </div>
 
     <script src="/static/app.js"></script>
     <script>

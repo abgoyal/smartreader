@@ -221,11 +221,25 @@ function renderStories() {
         if (match) expandedIds.add(parseInt(match[1]));
     });
 
-    // Sort stories based on checkbox
+    // Filter and sort stories
+    const frontPageOnly = document.getElementById('front-page-only').checked;
     const sortOldest = document.getElementById('sort-oldest').checked;
-    const sortedStories = [...stories].sort((a, b) => {
+
+    let filteredStories = stories;
+    if (frontPageOnly) {
+        filteredStories = stories.filter(s => s.hit_front_page);
+    }
+
+    const sortedStories = [...filteredStories].sort((a, b) => {
         return sortOldest ? a.time - b.time : b.time - a.time;
     });
+
+    if (sortedStories.length === 0) {
+        dom.storyList.innerHTML = '<li class="empty-msg">No stories match filters</li>';
+        updateStoryCount();
+        selectedIndex = -1;
+        return;
+    }
 
     dom.storyList.innerHTML = sortedStories.map((s, i) => renderStory(s, i)).join('');
     updateStoryCount();
@@ -379,6 +393,33 @@ async function loadUsageStats() {
         `;
     } catch (e) {
         container.innerHTML = '<span style="color: var(--danger);">Failed to load usage stats</span>';
+    }
+}
+
+async function updateSidebarCfStats() {
+    const el = document.getElementById('cf-stats-value');
+    if (!el) return;
+
+    try {
+        const [usage, status] = await Promise.all([
+            api.get('/api/usage'),
+            api.get('/api/status'),
+        ]);
+
+        const formatMs = (ms) => {
+            if (ms < 1000) return `${Math.round(ms)}ms`;
+            if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+            return `${(ms / 60000).toFixed(1)}m`;
+        };
+
+        if (status.cf_quota && status.cf_quota.exceeded) {
+            const mins = Math.floor(status.cf_quota.resets_in_seconds / 60);
+            el.innerHTML = `<span class="cf-quota-warning">Quota exceeded, resets in ${mins}m</span>`;
+        } else {
+            el.textContent = `${usage.today.requests} req, ${formatMs(usage.today.browser_ms)}`;
+        }
+    } catch (e) {
+        el.textContent = '--';
     }
 }
 
@@ -842,6 +883,9 @@ function startStatusPolling() {
             if (stats.blocked_content > 0) contentStatus += `, ${stats.blocked_content} blocked`;
             dom.contentStatus.textContent = contentStatus;
 
+            // Update sidebar CF stats
+            updateSidebarCfStats();
+
             // Only fetch story updates if content status actually changed
             const contentChanged = stats.pending_content !== lastPending || stats.done_content !== lastDone;
             lastPending = stats.pending_content;
@@ -1010,6 +1054,7 @@ document.querySelectorAll('.tab').forEach(tab => {
 // Filter checkboxes
 document.getElementById('show-dismissed').addEventListener('change', loadStories);
 document.getElementById('show-blocked').addEventListener('change', loadStories);
+document.getElementById('front-page-only').addEventListener('change', renderStories);
 document.getElementById('sort-oldest').addEventListener('change', renderStories);
 
 // Refresh button
@@ -1066,6 +1111,7 @@ dom.init();
 initTagDelegation();
 loadStories();
 startStatusPolling();
+updateSidebarCfStats();
 
 // Cleanup on page unload
 window.addEventListener('beforeunload', () => {

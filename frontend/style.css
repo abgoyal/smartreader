@@ -183,12 +183,72 @@ body {
     margin-bottom: 4px;
 }
 
+/* Sidebar controls */
+#sidebar-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 15px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+}
+
+#sidebar-controls label {
+    font-size: 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+}
+
+#sidebar-controls button {
+    padding: 6px 10px;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.75rem;
+    margin-top: 5px;
+}
+
+#sidebar-controls button:hover {
+    opacity: 0.9;
+}
+
+/* Sidebar CF stats */
+#sidebar-cf-stats {
+    font-size: 0.7rem;
+    color: var(--fg-dim);
+    padding: 8px 0;
+    border-top: 1px solid var(--border);
+}
+
+#sidebar-cf-stats .cf-stats-label {
+    font-weight: 500;
+    margin-bottom: 2px;
+}
+
+#sidebar-cf-stats .cf-quota-warning {
+    color: #e65100;
+    font-weight: 500;
+}
+
+[data-theme="dark"] #sidebar-cf-stats .cf-quota-warning {
+    color: #ffb74d;
+}
+
 /* Sidebar shortcuts hint */
 .sidebar-shortcuts {
     margin-top: auto;
-    font-size: 0.7rem;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+}
+
+.sidebar-shortcuts .shortcut-hint {
+    font-size: 0.65rem;
     color: var(--fg-dim);
-    line-height: 1.8;
+    cursor: pointer;
 }
 
 .sidebar-shortcuts kbd {
@@ -196,7 +256,7 @@ body {
     padding: 1px 4px;
     border-radius: 3px;
     font-family: monospace;
-    font-size: 0.65rem;
+    font-size: 0.6rem;
 }
 
 /* Main content */
@@ -215,39 +275,6 @@ main {
     display: block;
 }
 
-/* Controls */
-#controls {
-    display: flex;
-    gap: 15px;
-    align-items: center;
-    margin-bottom: 15px;
-    padding: 10px;
-    background: var(--bg-alt);
-    border-radius: 6px;
-    flex-wrap: wrap;
-}
-
-#controls label {
-    font-size: 0.85rem;
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    cursor: pointer;
-}
-
-#controls button {
-    padding: 6px 12px;
-    background: var(--accent);
-    color: white;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-    margin-left: auto;
-}
-
-#controls button:hover {
-    opacity: 0.9;
-}
 
 /* Story list */
 #story-list, #readlater-list {
@@ -707,17 +734,10 @@ main {
     opacity: 1;
 }
 
-/* Shortcuts help */
+/* Shortcuts help (in sidebar) */
 #shortcuts-help {
-    position: fixed;
-    bottom: 20px;
-    right: 20px;
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 15px;
-    font-size: 0.8rem;
-    z-index: 500;
+    margin-top: 8px;
+    font-size: 0.7rem;
 }
 
 #shortcuts-help.hidden {
@@ -725,7 +745,8 @@ main {
 }
 
 #shortcuts-help h4 {
-    margin: 0 0 10px 0;
+    margin: 0 0 6px 0;
+    font-size: 0.7rem;
     color: var(--accent);
 }
 
@@ -736,14 +757,16 @@ main {
 }
 
 #shortcuts-help li {
-    margin: 4px 0;
+    margin: 2px 0;
+    color: var(--fg-dim);
 }
 
 #shortcuts-help kbd {
     background: var(--border);
-    padding: 2px 6px;
+    padding: 1px 4px;
     border-radius: 3px;
     font-family: monospace;
+    font-size: 0.6rem;
 }
 
 /* Empty messages */
@@ -825,27 +848,36 @@ main {
         margin-bottom: 0;
     }
 
-    .sidebar-shortcuts {
+    #sidebar-controls {
+        display: flex;
+        flex-direction: row;
+        flex-wrap: wrap;
+        gap: 8px;
+        width: 100%;
+        order: 4;
+        padding-top: 8px;
+        margin-bottom: 0;
+        border-top: 1px solid var(--border);
+    }
+
+    #sidebar-controls label {
+        font-size: 0.7rem;
+    }
+
+    #sidebar-controls button {
+        margin-top: 0;
+        margin-left: auto;
+    }
+
+    .sidebar-shortcuts,
+    #shortcuts-help,
+    #sidebar-cf-stats {
         display: none;
     }
 
     main {
         margin-left: 0;
         padding: 10px;
-    }
-
-    #controls {
-        gap: 10px;
-        padding: 8px;
-    }
-
-    #controls label {
-        font-size: 0.75rem;
-    }
-
-    #controls button {
-        width: auto;
-        margin-left: auto;
     }
 
     .story {
@@ -928,10 +960,6 @@ main {
     #modal-body {
         max-height: 50vh;
         font-size: 0.85rem;
-    }
-
-    #shortcuts-help {
-        display: none !important;
     }
 
     .badge {
