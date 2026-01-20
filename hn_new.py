@@ -2319,7 +2319,12 @@ async def main_async(args):
     import uvicorn
 
     config = uvicorn.Config(
-        app, host=host, port=args.port, log_level="info", log_config=None, access_log=False
+        app,
+        host=host,
+        port=args.port,
+        log_level="info",
+        log_config=None,
+        access_log=False,
     )
     server = uvicorn.Server(config)
     await server.serve()
