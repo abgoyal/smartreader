@@ -1845,6 +1845,34 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
 app.add_middleware(BasicAuthMiddleware)
 
 
+# Request logging middleware - logs with real client IP
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Get real client IP (check X-Forwarded-For for reverse proxy)
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            # X-Forwarded-For can be comma-separated list, first is original client
+            client_ip = forwarded.split(",")[0].strip()
+        else:
+            client_ip = request.client.host if request.client else "-"
+
+        # Process request
+        start_time = time.time()
+        response = await call_next(request)
+        duration_ms = (time.time() - start_time) * 1000
+
+        # Log request (skip noisy SSE endpoint)
+        if not request.url.path.endswith("/updates"):
+            log.info(
+                f'{client_ip} "{request.method} {request.url.path}" {response.status_code} {duration_ms:.0f}ms'
+            )
+
+        return response
+
+
+app.add_middleware(RequestLoggingMiddleware)
+
+
 # Serve frontend static files (from directory or zip)
 # Custom handler to serve from zip file
 class ZipStaticFiles:
@@ -2291,7 +2319,7 @@ async def main_async(args):
     import uvicorn
 
     config = uvicorn.Config(
-        app, host=host, port=args.port, log_level="info", log_config=None
+        app, host=host, port=args.port, log_level="info", log_config=None, access_log=False
     )
     server = uvicorn.Server(config)
     await server.serve()
