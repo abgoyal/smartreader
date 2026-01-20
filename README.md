@@ -12,8 +12,11 @@ Fetches new stories on a schedule, extracts article content via Cloudflare Brows
 - **Self-post support**: Ask HN, Tell HN, and other text posts display inline
 - **Scheduled fetching**: Hourly by default, configurable
 - **Keyboard navigation**: vim-style (j/k) with auto-expanding content
+- **Mobile-friendly**: Card-based feed with tap zones, FAB menu, bottom sheet
 - **Filtering**: Block domains/words, merit/demerit scoring
 - **Read later**: Save stories for later reading
+- **Activity stats**: Track dismiss/save/expand actions (hour/day/week)
+- **Offline detection**: Shows banner when offline, auto-refreshes when back
 - **Usage tracking**: Monitor Cloudflare API usage for billing
 - **Quota handling**: Pauses extraction when daily free tier limit is reached
 - **Sidebar layout**: Compact header in left sidebar to maximize reading space

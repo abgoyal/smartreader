@@ -239,6 +239,25 @@ body {
     color: #ffb74d;
 }
 
+#sidebar-activity-stats {
+    font-size: 0.7rem;
+    color: var(--fg-dim);
+    padding: 8px 0;
+    border-top: 1px solid var(--border);
+}
+
+#sidebar-activity-stats .activity-stats-label {
+    font-weight: 500;
+    margin-bottom: 4px;
+}
+
+#sidebar-activity-stats .stat-row,
+#mobile-activity-stats .stat-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 2px 0;
+}
+
 /* Sidebar shortcuts hint */
 .sidebar-shortcuts {
     margin-top: auto;
@@ -549,6 +568,14 @@ main {
     opacity: 1;
 }
 
+/* Hide mobile elements on desktop */
+.mobile-actions,
+.fab-menu,
+.bottom-sheet,
+.bottom-sheet-backdrop {
+    display: none;
+}
+
 .action-btn {
     background: none;
     border: 1px solid var(--border);
@@ -770,11 +797,52 @@ main {
     font-size: 0.6rem;
 }
 
-/* Empty messages */
-.empty-msg {
+/* Empty/loading/error messages */
+.empty-msg,
+.loading-msg,
+.error-msg {
     text-align: center;
     color: var(--fg-dim);
     padding: 40px;
+    list-style: none;
+}
+
+.loading-msg::before {
+    content: "⟳ ";
+    display: inline-block;
+    animation: spin 1s linear infinite;
+}
+
+.error-msg {
+    color: var(--danger);
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+/* Offline state */
+body.offline::before {
+    content: "Offline";
+    position: fixed;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--warning-bg);
+    color: var(--warning-text);
+    padding: 4px 16px;
+    font-size: 0.75rem;
+    font-weight: 500;
+    z-index: 9999;
+    border-bottom-left-radius: 4px;
+    border-bottom-right-radius: 4px;
+}
+
+body.offline #btn-refresh,
+body.offline .fab-menu {
+    opacity: 0.5;
+    pointer-events: none;
 }
 
 /* Scrollbar */
@@ -796,102 +864,374 @@ main {
 }
 
 /* =============================================================================
-   Mobile Responsive Styles
+   Mobile Responsive Styles - Card-based feed
+   See MOBILE_UX.md for design spec
    ============================================================================= */
 
-/* Tablet and below - basic responsive (mobile UX TODO) */
 @media (max-width: 900px) {
+    /* Hide desktop sidebar completely */
+    .sidebar {
+        display: none;
+    }
+
+    /* Full screen feed */
     .app-layout {
         flex-direction: column;
     }
 
-    .sidebar {
-        position: relative;
-        width: 100%;
-        flex-direction: row;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 10px;
-        padding: 10px 15px;
-        border-right: none;
-        border-bottom: 1px solid var(--border);
-    }
-
-    .sidebar-header {
-        margin-bottom: 0;
-    }
-
-    .sidebar h1 {
-        font-size: 1.1rem;
-    }
-
-    #view-tabs {
-        flex-direction: row;
-        margin-bottom: 0;
-        flex: 1;
-    }
-
-    .tab {
-        padding: 6px 12px;
-        font-size: 0.8rem;
-    }
-
-    #status-bar,
-    #sidebar-controls,
-    #sidebar-cf-stats,
-    .sidebar-shortcuts,
-    #shortcuts-help {
-        display: none;
-    }
-
     main {
         margin-left: 0;
-        padding: 10px;
+        padding: 0;
         max-width: 100%;
+        min-height: 100vh;
+    }
+
+    /* Story list becomes card feed */
+    #story-list {
+        padding: 10px;
+        gap: 12px;
+        display: flex;
+        flex-direction: column;
+    }
+
+    /* Story cards */
+    .story {
+        background: var(--bg-alt);
+        border-radius: 12px;
+        padding: 0;
+        margin: 0;
+        border: 1px solid var(--border);
+        overflow: hidden;
+        position: relative;
+    }
+
+    .story.selected {
+        background: var(--bg-alt);
+        border-left: 1px solid var(--border);
+        border-color: var(--accent);
+    }
+
+    .story.front-page {
+        border-left: 4px solid #ff9800;
+    }
+
+    /* Card content area - tappable to expand */
+    .story-main {
+        padding: 14px 14px 60px 14px; /* Extra bottom padding for action zones */
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+        overflow: hidden; /* Prevent content overflow */
+    }
+
+    .story-main:active {
+        background: var(--border);
     }
 
     .story-header {
         flex-direction: column;
-        gap: 8px;
+        gap: 6px;
     }
 
     .story-title {
-        font-size: 0.95rem;
+        font-size: 1rem;
+        line-height: 1.4;
+    }
+
+    .story-title a {
+        word-break: break-word;
     }
 
     .story-domain {
         display: block;
         margin-left: 0;
-        margin-top: 4px;
+        margin-top: 2px;
+    }
+
+    .story-url {
+        display: none; /* Hide full URL on mobile, domain is enough */
     }
 
     .story-meta {
+        font-size: 0.8rem;
+        margin-top: 8px;
+    }
+
+    .story-teaser {
+        font-size: 0.85rem;
+        margin-top: 10px;
+        max-height: 100px;
+        overflow: hidden;
+        position: relative;
+    }
+
+    /* Fade out and "tap to read" hint */
+    .story-teaser::after {
+        content: "tap to read ▼";
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        padding: 20px 0 4px 0;
+        background: linear-gradient(transparent, var(--bg-alt) 60%);
+        text-align: center;
         font-size: 0.75rem;
+        color: var(--fg-dim);
+        pointer-events: none; /* Let clicks pass through to parent */
     }
 
+    /* Hide desktop action buttons */
     .story-actions {
-        opacity: 1;
+        display: none;
     }
 
+    /* Mobile tap zones - fixed at bottom of card */
+    .mobile-actions {
+        display: flex;
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        border-top: 1px solid var(--border);
+    }
+
+    .action-zone {
+        flex: 1;
+        padding: 12px;
+        text-align: center;
+        font-size: 1.2rem;
+        cursor: pointer;
+        transition: background 0.15s;
+        user-select: none;
+        -webkit-tap-highlight-color: transparent;
+    }
+
+    .action-zone:active {
+        background: var(--border);
+    }
+
+    .action-zone.dismiss {
+        border-right: 1px solid var(--border);
+        color: var(--danger, #e53935);
+    }
+
+    .action-zone.save {
+        color: var(--accent);
+    }
+
+    .action-zone.save.active {
+        color: #ffc107;
+    }
+
+    /* Expanded content */
+    .story-content {
+        display: block; /* Override desktop display:none */
+        max-height: 0;
+        font-size: 0.9rem;
+        padding: 0 14px;
+        overflow: hidden;
+        transition: max-height 0.3s ease-out, padding 0.3s ease-out;
+    }
+
+    .story-content.expanded {
+        max-height: 60vh;
+        overflow-y: auto;
+        overflow-x: hidden;
+        -webkit-overflow-scrolling: touch;
+        border-top: 1px solid var(--border);
+        margin-top: 10px;
+        padding: 14px;
+        word-wrap: break-word;
+        overflow-wrap: break-word;
+    }
+
+    /* Ensure code blocks and pre don't overflow */
+    .story-content pre,
+    .story-content code {
+        white-space: pre-wrap;
+        word-break: break-all;
+        max-width: 100%;
+        overflow-x: auto;
+    }
+
+    /* Hide "tap to read" hint when content is expanded */
+    .story:has(.story-content.expanded) .story-teaser::after {
+        display: none;
+    }
+
+    /* FAB Menu Button */
+    .fab-menu {
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        width: 56px;
+        height: 56px;
+        border-radius: 50%;
+        background: var(--accent);
+        color: white;
+        border: none;
+        font-size: 1.5rem;
+        cursor: pointer;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        z-index: 1003;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: transform 0.2s, box-shadow 0.2s;
+        -webkit-tap-highlight-color: transparent;
+    }
+
+    .fab-menu:active {
+        transform: scale(0.95);
+    }
+
+    /* Bottom Sheet */
+    .bottom-sheet {
+        display: block;
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        background: var(--bg);
+        border-top-left-radius: 16px;
+        border-top-right-radius: 16px;
+        box-shadow: 0 -4px 20px rgba(0,0,0,0.2);
+        z-index: 1002;
+        transform: translateY(100%);
+        transition: transform 0.3s ease-out;
+        max-height: 70vh;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .bottom-sheet.open {
+        transform: translateY(0);
+    }
+
+    .bottom-sheet-backdrop {
+        display: block;
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.5);
+        z-index: 1001;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.3s;
+    }
+
+    .bottom-sheet-backdrop.open {
+        opacity: 1;
+        pointer-events: auto;
+    }
+
+    .sheet-handle {
+        width: 100%;
+        padding: 12px 0;
+        cursor: pointer;
+        display: flex;
+        justify-content: center;
+        -webkit-tap-highlight-color: transparent;
+    }
+
+    .sheet-handle::before {
+        content: "";
+        width: 40px;
+        height: 4px;
+        background: var(--border);
+        border-radius: 2px;
+    }
+
+    .sheet-handle:active::before {
+        background: var(--fg-dim);
+    }
+
+    .sheet-content {
+        padding: 0 20px 20px 20px;
+    }
+
+    .sheet-section {
+        margin-bottom: 20px;
+    }
+
+    .sheet-section h3 {
+        font-size: 0.85rem;
+        color: var(--fg-dim);
+        margin-bottom: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    .sheet-tabs {
+        display: flex;
+        gap: 8px;
+    }
+
+    .sheet-tabs .tab {
+        flex: 1;
+        padding: 12px;
+        text-align: center;
+        border-radius: 8px;
+        font-size: 0.9rem;
+    }
+
+    .sheet-filters {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+    }
+
+    .sheet-filters label {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 0.95rem;
+        padding: 8px 0;
+    }
+
+    .sheet-filters input[type="checkbox"] {
+        width: 20px;
+        height: 20px;
+    }
+
+    .sheet-status {
+        font-size: 0.8rem;
+        color: var(--fg-dim);
+        line-height: 1.6;
+    }
+
+    /* Settings page on mobile */
     .settings-grid {
         grid-template-columns: 1fr;
+    }
+
+    .settings-section {
+        padding: 12px;
     }
 
     .add-form {
         flex-direction: column;
     }
 
-    .add-form input {
-        width: 100%;
-    }
-
+    .add-form input,
     .add-form button {
         width: 100%;
     }
 
+    /* Modal adjustments */
     .modal {
-        padding: 20px 10px;
+        padding: 10px;
     }
+
+    .modal-content {
+        border-radius: 12px;
+        max-height: 90vh;
+    }
+
+    /* Hide FAB on non-story views */
+    .view:not(#view-all) ~ .fab-menu,
+    #view-settings .fab-menu {
+        display: none;
+    }
+}
 
     .modal-content {
         padding: 15px;

@@ -68,6 +68,66 @@ const batcher = {
 };
 
 // =============================================================================
+// Activity Stats (client-side tracking)
+// =============================================================================
+
+const activityStats = {
+    STORAGE_KEY: 'hn_activity_stats',
+    MAX_AGE_MS: 7 * 24 * 60 * 60 * 1000, // 7 days
+
+    _load() {
+        try {
+            return JSON.parse(localStorage.getItem(this.STORAGE_KEY)) || [];
+        } catch {
+            return [];
+        }
+    },
+
+    _save(events) {
+        localStorage.setItem(this.STORAGE_KEY, JSON.stringify(events));
+    },
+
+    log(action) {
+        const events = this._load();
+        events.push({ action, ts: Date.now() });
+        // Prune old events
+        const cutoff = Date.now() - this.MAX_AGE_MS;
+        const pruned = events.filter(e => e.ts > cutoff);
+        this._save(pruned);
+    },
+
+    getCounts(action, sinceMs) {
+        const events = this._load();
+        const cutoff = Date.now() - sinceMs;
+        return events.filter(e => e.action === action && e.ts > cutoff).length;
+    },
+
+    getStats() {
+        const HOUR = 60 * 60 * 1000;
+        const DAY = 24 * HOUR;
+        const WEEK = 7 * DAY;
+
+        return {
+            dismissed: {
+                hour: this.getCounts('dismiss', HOUR),
+                today: this.getCounts('dismiss', DAY),
+                week: this.getCounts('dismiss', WEEK)
+            },
+            saved: {
+                hour: this.getCounts('save', HOUR),
+                today: this.getCounts('save', DAY),
+                week: this.getCounts('save', WEEK)
+            },
+            expanded: {
+                hour: this.getCounts('expand', HOUR),
+                today: this.getCounts('expand', DAY),
+                week: this.getCounts('expand', WEEK)
+            }
+        };
+    }
+};
+
+// =============================================================================
 // Helpers
 // =============================================================================
 
@@ -195,6 +255,10 @@ function renderStory(story, index) {
                     <button class="action-btn danger" onclick="blockDomain('${escapeHtml(story.domain)}')" title="Block domain (b)">⊘</button>
                     <button class="action-btn danger" onclick="dismissStory(${story.id})" title="Dismiss (d)">×</button>
                 </div>
+                <div class="mobile-actions">
+                    <div class="action-zone dismiss" onclick="dismissStory(${story.id}); event.stopPropagation();">×</div>
+                    <div class="action-zone save ${story.is_read_later ? 'active' : ''}" onclick="toggleReadLater(${story.id}); event.stopPropagation();">${story.is_read_later ? '★' : '☆'}</div>
+                </div>
             </div>
         </li>
     `;
@@ -275,6 +339,11 @@ async function loadStories() {
     const showDismissed = document.getElementById('show-dismissed').checked;
     const showBlocked = document.getElementById('show-blocked').checked;
 
+    // Show loading state
+    if (stories.length === 0) {
+        dom.storyList.innerHTML = '<li class="loading-msg">Loading stories...</li>';
+    }
+
     try {
         stories = await api.get(`/api/stories?include_dismissed=${showDismissed}&include_blocked=${showBlocked}`);
         renderStories();
@@ -285,6 +354,7 @@ async function loadStories() {
             selectedIndex = -1;
         }
     } catch (e) {
+        dom.storyList.innerHTML = '<li class="error-msg">Failed to load stories. Pull down to retry.</li>';
         showToast('Failed to load stories: ' + e.message);
     }
 }
@@ -472,11 +542,17 @@ async function toggleReadLater(storyId) {
     if (story) {
         story.is_read_later = !story.is_read_later;
         if (el) {
-            // Find the read-later button (has ☆ or ★)
+            // Update desktop button
             const btn = el.querySelector('.action-btn.readlater-btn');
             if (btn) {
                 btn.textContent = story.is_read_later ? '★' : '☆';
                 btn.classList.toggle('active', story.is_read_later);
+            }
+            // Update mobile save button
+            const mobileBtn = el.querySelector('.action-zone.save');
+            if (mobileBtn) {
+                mobileBtn.textContent = story.is_read_later ? '★' : '☆';
+                mobileBtn.classList.toggle('active', story.is_read_later);
             }
         }
     }
@@ -488,12 +564,18 @@ async function toggleReadLater(storyId) {
     } else {
         batcher.add('POST', `/api/readlater/${storyId}`);
         showToast('Added to read later');
+        activityStats.log('save');
+        updateActivityStats();
     }
+    hapticFeedback('light');
 }
 
 async function dismissStory(storyId) {
-    // Optimistic update - hide immediately
+    // Check if we're dismissing the currently selected story
     const el = document.querySelector(`.story[data-id="${storyId}"]`);
+    const wasDismissingSelected = el && el.classList.contains('selected');
+
+    // Optimistic update - hide immediately
     if (el) {
         el.style.display = 'none';
     }
@@ -502,16 +584,22 @@ async function dismissStory(storyId) {
     const idx = stories.findIndex(s => s.id === storyId);
     if (idx !== -1) stories.splice(idx, 1);
 
-    // Keep selection in bounds and reselect
-    const visible = getVisibleStoryElements();
-    if (selectedIndex >= visible.length) {
-        selectedIndex = Math.max(0, visible.length - 1);
+    // Only reselect/scroll if we dismissed the selected story (keyboard nav)
+    if (wasDismissingSelected) {
+        const visible = getVisibleStoryElements();
+        if (selectedIndex >= visible.length) {
+            selectedIndex = Math.max(0, visible.length - 1);
+        }
+        selectStory(selectedIndex);
     }
-    selectStory(selectedIndex);
     updateStoryCount();
 
     // Batched API call (fire-and-forget)
     batcher.add('POST', `/api/dismiss/${storyId}`);
+    showToast('Dismissed');
+    hapticFeedback('medium');
+    activityStats.log('dismiss');
+    updateActivityStats();
 }
 
 async function blockDomain(domain) {
@@ -544,6 +632,24 @@ async function blockDomain(domain) {
 function updateStoryCount() {
     const visible = getVisibleStoryElements();
     dom.storyCount.textContent = `${visible.length} stories`;
+    updateMobileStatus();
+}
+
+function updateActivityStats() {
+    const stats = activityStats.getStats();
+    const el = document.getElementById('activity-stats');
+    if (el) {
+        el.innerHTML = `
+            <div class="stat-row"><span>Dismissed:</span> <span>${stats.dismissed.hour}h / ${stats.dismissed.today}d / ${stats.dismissed.week}w</span></div>
+            <div class="stat-row"><span>Saved:</span> <span>${stats.saved.hour}h / ${stats.saved.today}d / ${stats.saved.week}w</span></div>
+            <div class="stat-row"><span>Expanded:</span> <span>${stats.expanded.hour}h / ${stats.expanded.today}d / ${stats.expanded.week}w</span></div>
+        `;
+    }
+    // Update mobile too
+    const mobileEl = document.getElementById('mobile-activity-stats');
+    if (mobileEl) {
+        mobileEl.innerHTML = el ? el.innerHTML : '';
+    }
 }
 
 async function markOpened(storyId) {
@@ -564,6 +670,10 @@ async function expandContent(storyId) {
         contentEl.removeAttribute('tabindex');
         return;
     }
+
+    // Log expand action
+    activityStats.log('expand');
+    updateActivityStats();
 
     // Make focusable for keyboard scrolling
     contentEl.setAttribute('tabindex', '-1');
@@ -882,6 +992,7 @@ function startStatusPolling() {
             if (stats.pending_content > 0) contentStatus += `, ${stats.pending_content} pending`;
             if (stats.blocked_content > 0) contentStatus += `, ${stats.blocked_content} blocked`;
             dom.contentStatus.textContent = contentStatus;
+            updateMobileStatus();
 
             // Update sidebar CF stats
             updateSidebarCfStats();
@@ -1103,15 +1214,125 @@ function toggleTheme() {
 }
 
 // =============================================================================
+// Mobile UI
+// =============================================================================
+
+function isMobile() {
+    return window.matchMedia('(max-width: 900px)').matches;
+}
+
+// Light haptic feedback for mobile actions
+function hapticFeedback(type = 'light') {
+    if (!navigator.vibrate) return;
+    switch (type) {
+        case 'light': navigator.vibrate(10); break;
+        case 'medium': navigator.vibrate(20); break;
+        case 'success': navigator.vibrate([10, 50, 10]); break;
+    }
+}
+
+// Mobile card tap handler - expand content when tapping card body (not links/actions)
+function initMobileCardTap() {
+    dom.storyList.addEventListener('click', (e) => {
+        if (!isMobile()) return;
+
+        // Ignore clicks on links, buttons, action zones, and teaser (teaser has its own onclick)
+        if (e.target.closest('a, button, .action-zone, .mobile-actions, .story-teaser')) return;
+
+        // Find the story card
+        const story = e.target.closest('.story');
+        if (!story) return;
+
+        const storyId = parseInt(story.dataset.id);
+        if (storyId) {
+            expandContent(storyId);
+        }
+    });
+}
+
+function toggleBottomSheet() {
+    const sheet = document.querySelector('.bottom-sheet');
+    const backdrop = document.querySelector('.bottom-sheet-backdrop');
+    if (!sheet || !backdrop) return;
+
+    const isOpen = sheet.classList.contains('open');
+    sheet.classList.toggle('open', !isOpen);
+    backdrop.classList.toggle('open', !isOpen);
+
+    // Sync mobile filters with desktop state when opening
+    if (!isOpen) {
+        syncMobileFiltersFromDesktop();
+    }
+}
+
+function syncMobileFiltersFromDesktop() {
+    const filters = ['show-dismissed', 'show-blocked', 'front-page-only', 'sort-oldest'];
+    filters.forEach(id => {
+        const desktopEl = document.getElementById(id);
+        const mobileEl = document.getElementById('mobile-' + id);
+        if (desktopEl && mobileEl) {
+            mobileEl.checked = desktopEl.checked;
+        }
+    });
+}
+
+function syncFilter(id, checked) {
+    const desktopEl = document.getElementById(id);
+    if (desktopEl) {
+        desktopEl.checked = checked;
+        // Trigger change event to run the filter logic
+        desktopEl.dispatchEvent(new Event('change'));
+    }
+}
+
+function updateMobileStatus() {
+    const mobileStoryCount = document.getElementById('mobile-story-count');
+    const mobileContentStatus = document.getElementById('mobile-content-status');
+
+    if (mobileStoryCount && dom.storyCount) {
+        mobileStoryCount.textContent = dom.storyCount.textContent;
+    }
+    if (mobileContentStatus && dom.contentStatus) {
+        mobileContentStatus.textContent = dom.contentStatus.textContent;
+    }
+}
+
+// =============================================================================
+// Offline Detection
+// =============================================================================
+
+function updateOnlineStatus() {
+    const isOffline = !navigator.onLine;
+    document.body.classList.toggle('offline', isOffline);
+    if (isOffline) {
+        showToast('You are offline');
+    } else {
+        showToast('Back online');
+        // Refresh data when coming back online
+        if (currentView === 'all') loadStories();
+    }
+}
+
+window.addEventListener('online', updateOnlineStatus);
+window.addEventListener('offline', updateOnlineStatus);
+
+// =============================================================================
 // Initialize
 // =============================================================================
 
 initTheme();
 dom.init();
 initTagDelegation();
+initMobileCardTap();
 loadStories();
 startStatusPolling();
 updateSidebarCfStats();
+updateActivityStats();
+
+// Check initial offline state (without toast)
+if (!navigator.onLine) {
+    document.body.classList.add('offline');
+}
 
 // Cleanup on page unload
 window.addEventListener('beforeunload', () => {
