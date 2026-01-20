@@ -78,6 +78,7 @@ body {
     margin: 0;
     padding: 0;
     line-height: 1.5;
+    overflow-x: hidden;
 }
 
 /* App Layout - Sidebar + Main */
@@ -86,7 +87,7 @@ body {
     min-height: 100vh;
 }
 
-/* Sidebar (was header) */
+/* Sidebar */
 .sidebar {
     width: var(--sidebar-width);
     background: var(--bg-alt);
@@ -798,7 +799,7 @@ main {
    Mobile Responsive Styles
    ============================================================================= */
 
-/* Tablet and below - convert to traditional header layout */
+/* Tablet and below - basic responsive (mobile UX TODO) */
 @media (max-width: 900px) {
     .app-layout {
         flex-direction: column;
@@ -835,53 +836,18 @@ main {
         font-size: 0.8rem;
     }
 
-    #status-bar {
-        display: flex;
-        gap: 10px;
-        font-size: 0.7rem;
-        margin-bottom: 0;
-        width: 100%;
-        order: 3;
-    }
-
-    #status-bar > div {
-        margin-bottom: 0;
-    }
-
-    #sidebar-controls {
-        display: flex;
-        flex-direction: row;
-        flex-wrap: wrap;
-        gap: 8px;
-        width: 100%;
-        order: 4;
-        padding-top: 8px;
-        margin-bottom: 0;
-        border-top: 1px solid var(--border);
-    }
-
-    #sidebar-controls label {
-        font-size: 0.7rem;
-    }
-
-    #sidebar-controls button {
-        margin-top: 0;
-        margin-left: auto;
-    }
-
+    #status-bar,
+    #sidebar-controls,
+    #sidebar-cf-stats,
     .sidebar-shortcuts,
-    #shortcuts-help,
-    #sidebar-cf-stats {
+    #shortcuts-help {
         display: none;
     }
 
     main {
         margin-left: 0;
         padding: 10px;
-    }
-
-    .story {
-        padding: 10px 0;
+        max-width: 100%;
     }
 
     .story-header {
@@ -905,31 +871,10 @@ main {
 
     .story-actions {
         opacity: 1;
-        justify-content: flex-start;
-        margin-top: 8px;
-    }
-
-    .action-btn {
-        padding: 8px 12px;
-        font-size: 0.85rem;
-    }
-
-    .story-teaser {
-        font-size: 0.8rem;
-        max-height: 120px;
-    }
-
-    .story-content {
-        max-height: 300px;
-        font-size: 0.85rem;
     }
 
     .settings-grid {
         grid-template-columns: 1fr;
-    }
-
-    .settings-section {
-        padding: 12px;
     }
 
     .add-form {
