@@ -253,10 +253,14 @@ function renderStory(story, index) {
                     </button>
                     <button class="action-btn" onclick="expandContent(${story.id})" title="Expand (e)">◰</button>
                     <button class="action-btn danger" onclick="blockDomain('${escapeHtml(story.domain)}')" title="Block domain (b)">⊘</button>
-                    <button class="action-btn danger" onclick="dismissStory(${story.id})" title="Dismiss (d)">×</button>
+                    ${story.is_dismissed
+                        ? `<button class="action-btn restore" onclick="undismissStory(${story.id})" title="Restore (d)">↩</button>`
+                        : `<button class="action-btn danger" onclick="dismissStory(${story.id})" title="Dismiss (d)">×</button>`}
                 </div>
                 <div class="mobile-actions">
-                    <div class="action-zone dismiss" onclick="dismissStory(${story.id}); event.stopPropagation();">×</div>
+                    ${story.is_dismissed
+                        ? `<div class="action-zone restore" onclick="undismissStory(${story.id}); event.stopPropagation();">↩</div>`
+                        : `<div class="action-zone dismiss" onclick="dismissStory(${story.id}); event.stopPropagation();">×</div>`}
                     <div class="action-zone save ${story.is_read_later ? 'active' : ''}" onclick="toggleReadLater(${story.id}); event.stopPropagation();">${story.is_read_later ? '★' : '☆'}</div>
                 </div>
             </div>
@@ -575,12 +579,12 @@ async function dismissStory(storyId) {
     const el = document.querySelector(`.story[data-id="${storyId}"]`);
     const wasDismissingSelected = el && el.classList.contains('selected');
 
-    // Optimistic update - hide immediately
+    // Optimistic update - hide immediately (works for both main list and read later view)
     if (el) {
         el.style.display = 'none';
     }
 
-    // Remove from local array
+    // Remove from local stories array
     const idx = stories.findIndex(s => s.id === storyId);
     if (idx !== -1) stories.splice(idx, 1);
 
@@ -600,6 +604,26 @@ async function dismissStory(storyId) {
     hapticFeedback('medium');
     activityStats.log('dismiss');
     updateActivityStats();
+}
+
+async function undismissStory(storyId) {
+    const story = stories.find(s => s.id === storyId);
+    if (!story) return;
+
+    // Optimistic update
+    story.is_dismissed = false;
+    renderStories();
+
+    try {
+        await api.delete(`/api/dismiss/${storyId}`);
+        showToast('Restored');
+        hapticFeedback('light');
+    } catch (e) {
+        // Revert on failure
+        story.is_dismissed = true;
+        renderStories();
+        showToast('Failed to restore: ' + e.message);
+    }
 }
 
 async function blockDomain(domain) {
@@ -1126,7 +1150,9 @@ document.addEventListener('keydown', (e) => {
             if (story) toggleReadLater(story.id);
             break;
         case 'd':
-            if (story) dismissStory(story.id);
+            if (story) {
+                story.is_dismissed ? undismissStory(story.id) : dismissStory(story.id);
+            }
             break;
         case 'b':
             if (story && story.domain) blockDomain(story.domain);

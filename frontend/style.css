@@ -603,6 +603,16 @@ main {
     border-color: var(--danger);
 }
 
+.action-btn.restore {
+    color: var(--success);
+    border-color: var(--success);
+}
+
+.action-btn.restore:hover {
+    background: var(--success);
+    color: white;
+}
+
 /* Settings */
 .settings-grid {
     display: grid;
@@ -1012,6 +1022,11 @@ body.offline .fab-menu {
     .action-zone.dismiss {
         border-right: 1px solid var(--border);
         color: var(--danger, #e53935);
+    }
+
+    .action-zone.restore {
+        border-right: 1px solid var(--border);
+        color: var(--success);
     }
 
     .action-zone.save {

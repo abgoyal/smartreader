@@ -85,6 +85,9 @@ All configuration via `.env` file (see `.env.example`):
 | `CF_BROWSER_TIMEOUT_MS` | Page load timeout in ms | 2000 |
 | `HN_FETCH_INTERVAL` | Minutes between fetches | 60 |
 | `HN_CONTENT_WORKERS` | Content extraction workers | 3 |
+| `CLEANUP_DISMISSED_HOURS` | Hours before dismissed stories are deleted | 24 |
+| `CLEANUP_STORY_DAYS` | Days before old stories are deleted (read later exempt) | 14 |
+| `CLEANUP_CONTENT_CACHE_DAYS` | Days before cached content is deleted | 90 |
 
 ### CLI Options
 
@@ -94,6 +97,8 @@ All configuration via `.env` file (see `.env.example`):
 | `--public` | Bind to 0.0.0.0 (all interfaces) |
 | `--reset` | Clear all stories and start fresh |
 | `--workers N` | Number of content workers (default: 3) |
+| `--migrate-compress` | Compress existing content (creates backup first, run once) |
+| `--vacuum` | Reclaim disk space immediately (auto-runs daily if needed) |
 
 ### Keyboard Shortcuts
 
@@ -119,7 +124,9 @@ All configuration via `.env` file (see `.env.example`):
 ├── hn_new.py      # Main script
 ├── ui.zip         # Frontend assets
 ├── .env           # Secrets (CF credentials, auth)
-└── .hn_data/      # SQLite database (created automatically)
+└── .hn_data/      # Data directory (created automatically)
+    ├── hn.db      # SQLite database
+    └── backups/   # Hourly/daily/weekly backups (15 files max)
 ```
 
 ### Step-by-Step Deployment
@@ -215,8 +222,36 @@ This triggers the workflow which builds and publishes:
 1. **Story Fetcher**: Runs on startup + hourly, fetches new stories from HN
 2. **Content Workers**: Multiple workers extract article content via Cloudflare (rate-limited per domain)
 3. **Front Page Tracker**: Polls HN front page every 5 minutes to track which stories make it
+4. **Story Cleanup**: Runs hourly, manages data retention (see below)
 
 All tasks run independently; server is always ready to serve requests.
+
+### Data Retention
+
+The cleanup task manages database size with the following retention policy:
+
+| Data | Retention | Configurable |
+|------|-----------|--------------|
+| Dismissed stories | 24 hours grace period | `CLEANUP_DISMISSED_HOURS` |
+| Old stories | 14 days (read later exempt) | `CLEANUP_STORY_DAYS` |
+| Content cache | 90 days | `CLEANUP_CONTENT_CACHE_DAYS` |
+| Dismissed markers | 60 days | No |
+| Usage logs | 6 months | No |
+| Usage summaries | 36 months | No |
+
+Usage logs are aggregated into monthly summaries (request count + browser time) before deletion, preserving billing history for 3 years.
+
+### Backups
+
+Automatic backups are created hourly in `.hn_data/backups/` with a rotation scheme:
+
+| Slot | Files | Coverage |
+|------|-------|----------|
+| Hourly | 1h, 2h, 6h, 12h | Last 12 hours (4 files) |
+| Daily | 1d-7d | Last week (7 files) |
+| Weekly | 1w-4w | Last month (4 files) |
+
+Total: 15 backup files max. Backups use SQLite's online backup API for consistency.
 
 ### Free Tier Quota
 

@@ -35,6 +35,7 @@ import argparse
 import asyncio
 import base64
 import logging
+import zlib
 import os
 import re
 import secrets
@@ -200,6 +201,42 @@ CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
 CF_BROWSER_API = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/browser-rendering/markdown"
 
+# Cleanup configuration
+CLEANUP_DISMISSED_HOURS = int(os.environ.get("CLEANUP_DISMISSED_HOURS", "24"))
+CLEANUP_STORY_DAYS = int(os.environ.get("CLEANUP_STORY_DAYS", "14"))
+CLEANUP_CONTENT_CACHE_DAYS = int(os.environ.get("CLEANUP_CONTENT_CACHE_DAYS", "90"))
+
+# =============================================================================
+# Content Compression
+# =============================================================================
+# Content is stored compressed with "z:" prefix. Uncompressed content has no prefix.
+# This allows backwards compatibility - old uncompressed content still works.
+
+COMPRESS_PREFIX = "z:"
+
+
+def compress_content(text: str) -> str:
+    """Compress text content for storage. Returns z: prefixed base64 string."""
+    if not text:
+        return text
+    compressed = zlib.compress(text.encode("utf-8"), level=6)
+    return COMPRESS_PREFIX + base64.b64encode(compressed).decode("ascii")
+
+
+def decompress_content(data: str) -> str:
+    """Decompress content if compressed, otherwise return as-is."""
+    if not data:
+        return data
+    if not data.startswith(COMPRESS_PREFIX):
+        return data  # Not compressed, return as-is
+    try:
+        compressed = base64.b64decode(data[len(COMPRESS_PREFIX) :])
+        return zlib.decompress(compressed).decode("utf-8")
+    except Exception:
+        # If decompression fails, return original (safety fallback)
+        return data
+
+
 # =============================================================================
 # Database Schema & Operations
 # =============================================================================
@@ -242,6 +279,14 @@ CREATE TABLE IF NOT EXISTS usage_log (
     url TEXT,
     browser_ms REAL,
     source TEXT,  -- 'cloudflare'
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Monthly usage summaries (aggregated from usage_log, kept for 3 years)
+CREATE TABLE IF NOT EXISTS usage_summary (
+    month TEXT PRIMARY KEY,  -- 'YYYY-MM' format
+    request_count INTEGER DEFAULT 0,
+    total_browser_ms REAL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -291,9 +336,9 @@ CREATE TABLE IF NOT EXISTS read_later (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Dismissed stories (hide from current session)
+-- Dismissed stories (hide from current session, kept after story deletion to prevent re-fetch)
 CREATE TABLE IF NOT EXISTS dismissed (
-    story_id INTEGER PRIMARY KEY REFERENCES stories(id),
+    story_id INTEGER PRIMARY KEY,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -323,8 +368,15 @@ class Database:
                 str(self.db_path), check_same_thread=False
             )
             self._local.conn.row_factory = sqlite3.Row
+            # Safety
             self._local.conn.execute("PRAGMA foreign_keys = ON")
             self._local.conn.execute("PRAGMA journal_mode = WAL")
+            self._local.conn.execute("PRAGMA synchronous = NORMAL")  # Safe with WAL
+            self._local.conn.execute("PRAGMA busy_timeout = 5000")  # Wait 5s for locks
+            # Performance
+            self._local.conn.execute("PRAGMA cache_size = -64000")  # 64MB cache
+            self._local.conn.execute("PRAGMA temp_store = MEMORY")
+            self._local.conn.execute("PRAGMA mmap_size = 268435456")  # 256MB mmap
         return self._local.conn
 
     def init(self):
@@ -367,6 +419,8 @@ class Database:
 
         # For stories without URL but with text (Ask HN, etc.), use the text as content
         if not url and hn_text:
+            # Compress HN text content before storing
+            compressed_text = compress_content(hn_text)
             self.execute(
                 """
                 INSERT INTO stories (id, title, url, domain, by, time, score, descendants, content, content_status, content_source)
@@ -388,7 +442,7 @@ class Database:
                     story.get("time"),
                     story.get("score", 0),
                     story.get("descendants", 0),
-                    hn_text,
+                    compressed_text,
                 ),
             )
         else:
@@ -464,6 +518,10 @@ class Database:
 
         for row in rows:
             story = dict(row)
+
+            # Decompress content if compressed
+            if story.get("content"):
+                story["content"] = decompress_content(story["content"])
 
             # Skip blocked words in title
             title_lower = story["title"].lower()
@@ -563,6 +621,8 @@ class Database:
         browser_ms: float = 0,
     ):
         """Mark a content fetch job as complete (done, failed, blocked, skipped)."""
+        # Compress content before storing
+        compressed = compress_content(content) if content else content
         self.execute(
             """
             UPDATE stories
@@ -570,7 +630,7 @@ class Database:
                 browser_ms = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
         """,
-            (content, status, source, browser_ms, story_id),
+            (compressed, status, source, browser_ms, story_id),
         )
         self.commit()
 
@@ -823,7 +883,13 @@ class Database:
             JOIN read_later rl ON s.id = rl.story_id
             ORDER BY rl.created_at DESC
         """)
-        return [dict(r) for r in rows]
+        stories = []
+        for r in rows:
+            story = dict(r)
+            if story.get("content"):
+                story["content"] = decompress_content(story["content"])
+            stories.append(story)
+        return stories
 
     # --- Dismissed ---
 
@@ -831,6 +897,8 @@ class Database:
         self.execute(
             "INSERT OR IGNORE INTO dismissed (story_id) VALUES (?)", (story_id,)
         )
+        # Also remove from read_later so it follows the normal dismiss cleanup cycle
+        self.execute("DELETE FROM read_later WHERE story_id = ?", (story_id,))
         self.commit()
 
     def undismiss_story(self, story_id: int):
@@ -840,6 +908,398 @@ class Database:
     def clear_dismissed(self):
         self.execute("DELETE FROM dismissed")
         self.commit()
+
+    def cleanup_stories(
+        self,
+        dismissed_hours: int = 24,
+        max_age_days: int = 14,
+        content_cache_days: int = 90,
+    ) -> dict:
+        """
+        Clean up old stories and related data to keep database size bounded.
+
+        1. Delete stories dismissed more than `dismissed_hours` ago
+        2. Delete stories older than `max_age_days` (except those in read_later)
+        3. Delete content cache older than `content_cache_days`
+        4. Aggregate and delete usage logs older than 6 months
+        5. Delete usage summaries older than 36 months
+
+        Keeps dismissed markers to prevent re-fetching.
+        Returns count of deleted stories by reason.
+        """
+        dismissed_cutoff = int(time.time()) - (dismissed_hours * 3600)
+        age_cutoff = int(time.time()) - (max_age_days * 24 * 3600)
+        cache_cutoff = int(time.time()) - (content_cache_days * 24 * 3600)
+
+        # Count before deletion for reporting
+        dismissed_count = self.fetchone(
+            """
+            SELECT COUNT(*) as c FROM stories s
+            INNER JOIN dismissed d ON s.id = d.story_id
+            WHERE d.created_at < datetime(?, 'unixepoch')
+        """,
+            (dismissed_cutoff,),
+        )["c"]
+
+        old_count = self.fetchone(
+            """
+            SELECT COUNT(*) as c FROM stories s
+            WHERE s.time < ?
+            AND s.id NOT IN (SELECT story_id FROM read_later)
+            AND s.id NOT IN (SELECT story_id FROM dismissed)
+        """,
+            (age_cutoff,),
+        )["c"]
+
+        # Build list of story IDs to delete (dismissed past grace period)
+        dismissed_ids = [
+            r["id"]
+            for r in self.fetchall(
+                """
+                SELECT s.id FROM stories s
+                INNER JOIN dismissed d ON s.id = d.story_id
+                WHERE d.created_at < datetime(?, 'unixepoch')
+            """,
+                (dismissed_cutoff,),
+            )
+        ]
+
+        # Build list of old story IDs to delete
+        old_ids = [
+            r["id"]
+            for r in self.fetchall(
+                """
+                SELECT s.id FROM stories s
+                WHERE s.time < ?
+                AND s.id NOT IN (SELECT story_id FROM read_later)
+                AND s.id NOT IN (SELECT story_id FROM dismissed)
+            """,
+                (age_cutoff,),
+            )
+        ]
+
+        all_ids_to_delete = dismissed_ids + old_ids
+
+        if all_ids_to_delete:
+            # Delete from child tables FIRST (FK constraint compliance)
+            placeholders = ",".join("?" * len(all_ids_to_delete))
+            self.execute(
+                f"DELETE FROM history WHERE story_id IN ({placeholders})",
+                all_ids_to_delete,
+            )
+            self.execute(
+                f"DELETE FROM read_later WHERE story_id IN ({placeholders})",
+                all_ids_to_delete,
+            )
+
+            # Now safe to delete stories
+            self.execute(
+                f"DELETE FROM stories WHERE id IN ({placeholders})",
+                all_ids_to_delete,
+            )
+
+        # Clean up old dismissed markers (>60 days) - these story IDs won't reappear
+        # in HN's new feed, so no risk of re-fetching
+        marker_cutoff = int(time.time()) - (60 * 24 * 3600)
+        self.execute(
+            "DELETE FROM dismissed WHERE created_at < datetime(?, 'unixepoch')",
+            (marker_cutoff,),
+        )
+
+        # Clean up old content cache
+        self.execute(
+            "DELETE FROM fetched_urls WHERE fetched_at < datetime(?, 'unixepoch')",
+            (cache_cutoff,),
+        )
+
+        # Aggregate usage logs into monthly summaries before deleting
+        # Get the cutoff month (6 months ago, not counting current)
+        now = datetime.now()
+        # First day of current month
+        current_month_start = now.replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        # 6 months ago
+        usage_cutoff = current_month_start - timedelta(days=6 * 30)
+        usage_cutoff_str = usage_cutoff.strftime("%Y-%m-%d")
+
+        # Aggregate old usage logs into monthly summaries
+        self.execute(
+            """
+            INSERT INTO usage_summary (month, request_count, total_browser_ms)
+            SELECT
+                strftime('%Y-%m', created_at) as month,
+                COUNT(*) as request_count,
+                SUM(browser_ms) as total_browser_ms
+            FROM usage_log
+            WHERE created_at < ?
+            GROUP BY strftime('%Y-%m', created_at)
+            ON CONFLICT(month) DO UPDATE SET
+                request_count = usage_summary.request_count + excluded.request_count,
+                total_browser_ms = usage_summary.total_browser_ms + excluded.total_browser_ms
+        """,
+            (usage_cutoff_str,),
+        )
+
+        # Delete old usage logs (now that they're summarized)
+        self.execute("DELETE FROM usage_log WHERE created_at < ?", (usage_cutoff_str,))
+
+        # Delete old usage summaries (>36 months)
+        summary_cutoff = current_month_start - timedelta(days=36 * 30)
+        summary_cutoff_str = summary_cutoff.strftime("%Y-%m")
+        self.execute("DELETE FROM usage_summary WHERE month < ?", (summary_cutoff_str,))
+
+        self.commit()
+
+        total = dismissed_count + old_count
+        if total > 0:
+            log.info(
+                f"Cleanup: {dismissed_count} dismissed, {old_count} old stories deleted"
+            )
+
+        return {"dismissed": dismissed_count, "old": old_count}
+
+    def backup_rotate(self) -> Optional[str]:
+        """
+        Create a backup and rotate according to retention policy.
+
+        Retention slots:
+        - Hourly: 1h, 2h, 6h, 12h (4 files)
+        - Daily: 1d-7d (7 files)
+        - Weekly: 1w-4w (4 files)
+        Total: 15 backup files max
+
+        Returns the path of the new backup, or None if backup failed.
+        """
+        backup_dir = self.db_path.parent / "backups"
+        backup_dir.mkdir(exist_ok=True)
+
+        # Slot definitions: (filename, min_age_hours, max_age_hours)
+        # A backup in slot X should be between min and max age
+        hourly_slots = [
+            ("backup-1h.db", 0, 2),
+            ("backup-2h.db", 2, 6),
+            ("backup-6h.db", 6, 12),
+            ("backup-12h.db", 12, 24),
+        ]
+        daily_slots = [(f"backup-{i}d.db", 24 * i, 24 * (i + 1)) for i in range(1, 8)]
+        weekly_slots = [
+            (f"backup-{i}w.db", 24 * 7 * i, 24 * 7 * (i + 1)) for i in range(1, 5)
+        ]
+
+        all_slots = hourly_slots + daily_slots + weekly_slots
+
+        def get_file_age_hours(path: Path) -> Optional[float]:
+            if not path.exists():
+                return None
+            age_seconds = time.time() - path.stat().st_mtime
+            return age_seconds / 3600
+
+        def copy_file(src: Path, dst: Path):
+            import shutil
+
+            shutil.copy2(src, dst)
+
+        # Create new backup using SQLite backup API
+        new_backup = backup_dir / "backup-new.db"
+        try:
+            # Use SQLite's online backup API for consistency
+            src_conn = self._get_conn()
+            dst_conn = sqlite3.connect(str(new_backup))
+            src_conn.backup(dst_conn)
+            dst_conn.close()
+        except Exception as e:
+            log.error(f"Backup failed: {e}")
+            return None
+
+        # Rotate backups: work backwards through slots
+        # Move older backups to their next slot if they've aged out
+        for i in range(len(all_slots) - 1, -1, -1):
+            slot_name, min_age, max_age = all_slots[i]
+            slot_path = backup_dir / slot_name
+            age = get_file_age_hours(slot_path)
+
+            if age is None:
+                continue  # No backup in this slot
+
+            # If this backup is older than max_age, move to next slot or delete
+            if age > max_age:
+                if i < len(all_slots) - 1:
+                    # Move to next slot (only delete source if copy succeeds)
+                    next_slot_name = all_slots[i + 1][0]
+                    next_slot_path = backup_dir / next_slot_name
+                    try:
+                        copy_file(slot_path, next_slot_path)
+                        slot_path.unlink()
+                    except Exception as e:
+                        log.warning(f"Failed to rotate backup {slot_name}: {e}")
+                else:
+                    # Last slot, just delete (too old)
+                    try:
+                        slot_path.unlink()
+                    except Exception as e:
+                        log.warning(f"Failed to delete old backup {slot_name}: {e}")
+
+        # Move new backup to 1h slot
+        slot_1h = backup_dir / "backup-1h.db"
+        if slot_1h.exists():
+            # Current 1h might need to move to 2h first
+            age = get_file_age_hours(slot_1h)
+            if age and age >= 1:  # At least 1 hour old, eligible for 2h slot
+                slot_2h = backup_dir / "backup-2h.db"
+                try:
+                    copy_file(slot_1h, slot_2h)
+                except Exception as e:
+                    log.warning(f"Failed to rotate 1h backup to 2h: {e}")
+            try:
+                slot_1h.unlink()
+            except Exception as e:
+                log.warning(f"Failed to remove old 1h backup: {e}")
+
+        new_backup.rename(slot_1h)
+        log.debug(f"Backup created: {slot_1h}")
+
+        return str(slot_1h)
+
+    def migrate_compress_content(self, batch_size: int = 100) -> dict:
+        """
+        Migrate existing uncompressed content to compressed format.
+
+        SAFETY FEATURES:
+        - Creates a backup before starting
+        - Processes in batches with verification
+        - Each row is verified after compression (decompress and compare)
+        - Rolls back batch on any error
+        - Returns stats on completion
+
+        Returns dict with migration stats.
+        """
+        # Create backup first
+        log.info("Creating backup before compression migration...")
+        backup_path = self.backup_rotate()
+        if not backup_path:
+            raise RuntimeError("Failed to create backup before migration")
+        log.info(f"Backup created: {backup_path}")
+
+        # Count uncompressed content (doesn't start with z:)
+        total = self.fetchone(
+            f"SELECT COUNT(*) as c FROM stories WHERE content IS NOT NULL AND content != '' AND content NOT LIKE '{COMPRESS_PREFIX}%'"
+        )["c"]
+
+        if total == 0:
+            log.info("No uncompressed content to migrate")
+            return {"migrated": 0, "total": 0, "already_compressed": 0}
+
+        log.info(f"Found {total} stories with uncompressed content")
+
+        migrated = 0
+        errors = 0
+
+        while True:
+            # Get next batch of uncompressed content
+            rows = self.fetchall(
+                f"""
+                SELECT id, content FROM stories
+                WHERE content IS NOT NULL AND content != '' AND content NOT LIKE '{COMPRESS_PREFIX}%'
+                LIMIT ?
+            """,
+                (batch_size,),
+            )
+
+            if not rows:
+                break
+
+            batch_updates = []
+            for row in rows:
+                story_id = row["id"]
+                original = row["content"]
+
+                # Compress
+                compressed = compress_content(original)
+
+                # Verify by decompressing
+                decompressed = decompress_content(compressed)
+                if decompressed != original:
+                    log.error(
+                        f"Verification failed for story {story_id}: content mismatch!"
+                    )
+                    errors += 1
+                    continue
+
+                batch_updates.append((compressed, story_id))
+
+            # Apply batch update
+            if batch_updates:
+                self.executemany(
+                    "UPDATE stories SET content = ? WHERE id = ?",
+                    batch_updates,
+                )
+                self.commit()
+                migrated += len(batch_updates)
+                log.info(f"Migrated {migrated}/{total} stories...")
+
+        # Count already compressed
+        already_compressed = self.fetchone(
+            f"SELECT COUNT(*) as c FROM stories WHERE content LIKE '{COMPRESS_PREFIX}%'"
+        )["c"]
+
+        log.info(
+            f"Migration complete: {migrated} migrated, {errors} errors, {already_compressed} total compressed"
+        )
+
+        # VACUUM to reclaim space after compression
+        log.info("Running VACUUM to reclaim disk space...")
+        self.vacuum()
+        log.info("VACUUM complete")
+
+        return {
+            "migrated": migrated,
+            "errors": errors,
+            "total_compressed": already_compressed,
+            "backup": backup_path,
+        }
+
+    def vacuum(self):
+        """
+        Reclaim disk space by rebuilding the database.
+
+        Note: This requires exclusive access and temporary disk space
+        roughly equal to the current database size.
+        """
+        self.execute("VACUUM")
+        self.commit()
+
+    def maybe_vacuum(
+        self, min_free_pages: int = 1000, min_free_percent: float = 5.0
+    ) -> bool:
+        """
+        Run VACUUM if there's significant free space to reclaim.
+
+        Args:
+            min_free_pages: Minimum free pages before vacuuming (default 1000 = ~4MB)
+            min_free_percent: Minimum free space as % of total (default 5%)
+
+        Returns:
+            True if VACUUM was run, False if skipped.
+        """
+        free_pages = self.fetchone("PRAGMA freelist_count")["freelist_count"]
+        total_pages = self.fetchone("PRAGMA page_count")["page_count"]
+
+        if total_pages == 0:
+            return False
+
+        free_percent = (free_pages / total_pages) * 100
+
+        if free_pages >= min_free_pages or free_percent >= min_free_percent:
+            page_size = self.fetchone("PRAGMA page_size")["page_size"]
+            free_mb = (free_pages * page_size) / 1024 / 1024
+            log.info(
+                f"Running VACUUM to reclaim {free_mb:.1f}MB ({free_percent:.1f}% free)"
+            )
+            self.vacuum()
+            return True
+
+        return False
 
     # --- History ---
 
@@ -1722,6 +2182,43 @@ async def front_page_tracker(db: Database, stop_event: asyncio.Event):
     log.info("Front page tracker stopped")
 
 
+async def story_cleanup(db: Database, stop_event: asyncio.Event):
+    """Background task that periodically cleans up old stories and creates backups."""
+    cleanup_interval = 3600  # Run every hour
+    vacuum_interval = 24  # Run vacuum every 24 cleanups (daily)
+    cleanup_count = 0
+
+    log.info(
+        f"Story cleanup started (dismissed: {CLEANUP_DISMISSED_HOURS}h, max age: {CLEANUP_STORY_DAYS}d, cache: {CLEANUP_CONTENT_CACHE_DAYS}d)"
+    )
+
+    # Run cleanup and backup immediately on startup
+    db.cleanup_stories(
+        CLEANUP_DISMISSED_HOURS, CLEANUP_STORY_DAYS, CLEANUP_CONTENT_CACHE_DAYS
+    )
+    db.backup_rotate()
+    cleanup_count += 1
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=cleanup_interval)
+            break  # Stop event was set
+        except asyncio.TimeoutError:
+            pass  # Time to run cleanup
+
+        db.cleanup_stories(
+            CLEANUP_DISMISSED_HOURS, CLEANUP_STORY_DAYS, CLEANUP_CONTENT_CACHE_DAYS
+        )
+        db.backup_rotate()
+        cleanup_count += 1
+
+        # Run vacuum daily (every 24 cleanups) if there's significant free space
+        if cleanup_count % vacuum_interval == 0:
+            db.maybe_vacuum()
+
+    log.info("Story cleanup stopped")
+
+
 # =============================================================================
 # FastAPI Application
 # =============================================================================
@@ -1731,6 +2228,7 @@ db: Database = None
 content_workers: list[asyncio.Task] = []
 story_fetcher_task: asyncio.Task = None
 front_page_tracker_task: asyncio.Task = None
+cleanup_task: asyncio.Task = None
 stop_event: asyncio.Event = None
 fetch_status: dict = {"status": "idle", "progress": 0, "total": 0, "fetched": 0}
 cf_quota_exceeded_until: float = 0  # UTC timestamp when quota resets (0 = not exceeded)
@@ -1744,7 +2242,13 @@ DEFAULT_CONTENT_WORKERS = 3
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db, content_workers, stop_event, story_fetcher_task, front_page_tracker_task
+    global \
+        db, \
+        content_workers, \
+        stop_event, \
+        story_fetcher_task, \
+        front_page_tracker_task, \
+        cleanup_task
 
     # Initialize
     db = Database(DB_FILE)
@@ -1762,6 +2266,9 @@ async def lifespan(app: FastAPI):
 
     # Start front page tracker (polls topstories to detect front page hits)
     front_page_tracker_task = asyncio.create_task(front_page_tracker(db, stop_event))
+
+    # Start story cleanup task (removes old/dismissed stories)
+    cleanup_task = asyncio.create_task(story_cleanup(db, stop_event))
 
     # Start content workers
     # Multiple workers can run concurrently - they coordinate via:
@@ -1795,6 +2302,14 @@ async def lifespan(app: FastAPI):
         front_page_tracker_task.cancel()
         try:
             await front_page_tracker_task
+        except asyncio.CancelledError:
+            pass
+
+    # Cancel cleanup task
+    if cleanup_task:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
         except asyncio.CancelledError:
             pass
 
@@ -1977,7 +2492,10 @@ async def get_story(story_id: int):
     row = db.fetchone("SELECT * FROM stories WHERE id = ?", (story_id,))
     if not row:
         raise HTTPException(404, "Story not found")
-    return dict(row)
+    story = dict(row)
+    if story.get("content"):
+        story["content"] = decompress_content(story["content"])
+    return story
 
 
 @app.get("/api/story/{story_id}/content")
@@ -1987,7 +2505,8 @@ async def get_story_content(story_id: int):
     )
     if not row:
         raise HTTPException(404, "Story not found")
-    return {"content": row["content"], "status": row["content_status"]}
+    content = decompress_content(row["content"]) if row["content"] else row["content"]
+    return {"content": content, "status": row["content_status"]}
 
 
 @app.post("/api/story/{story_id}/opened")
@@ -2247,8 +2766,7 @@ async def get_story_updates():
     """Get stories with recently updated content (for efficient polling)."""
     # Return stories updated in the last minute with content
     rows = db.fetchall("""
-        SELECT id, title, content, content_status,
-               SUBSTR(content, 1, 300) as teaser
+        SELECT id, title, content, content_status
         FROM stories
         WHERE content_status IN ('done', 'blocked', 'failed')
           AND updated_at >= datetime('now', '-60 seconds')
@@ -2258,11 +2776,16 @@ async def get_story_updates():
     result = []
     for row in rows:
         story = dict(row)
-        if story.get("teaser"):
-            teaser = story["teaser"].strip()
-            if len(story.get("content", "")) > 300:
+        # Decompress content and generate teaser
+        if story.get("content"):
+            content = decompress_content(story["content"])
+            story["content"] = content
+            teaser = content[:TEASER_LENGTH].strip()
+            if len(content) > TEASER_LENGTH:
                 teaser += "..."
             story["teaser"] = teaser
+        else:
+            story["teaser"] = None
         result.append(story)
     return result
 
@@ -2345,7 +2868,44 @@ def main():
         default=None,
         help=f"Number of content workers (default: {DEFAULT_CONTENT_WORKERS})",
     )
+    parser.add_argument(
+        "--migrate-compress",
+        action="store_true",
+        help="Migrate existing content to compressed format (creates backup first)",
+    )
+    parser.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="Reclaim disk space by rebuilding the database (run after cleanup)",
+    )
     args = parser.parse_args()
+
+    # Handle migration mode (run and exit, don't start server)
+    if args.migrate_compress:
+        db = Database(DB_FILE)
+        db.init()
+        result = db.migrate_compress_content()
+        print(f"Migration complete: {result}")
+        return
+
+    # Handle vacuum mode (run and exit, don't start server)
+    if args.vacuum:
+        db = Database(DB_FILE)
+        db.init()
+        db_path = Path(DB_FILE)
+        size_before = db_path.stat().st_size if db_path.exists() else 0
+        print(f"Database size before: {size_before / 1024 / 1024:.2f} MB")
+        print("Running VACUUM (this may take a moment)...")
+        db.vacuum()
+        size_after = db_path.stat().st_size
+        saved = size_before - size_after
+        print(f"Database size after: {size_after / 1024 / 1024:.2f} MB")
+        print(
+            f"Space reclaimed: {saved / 1024 / 1024:.2f} MB ({saved / size_before * 100:.1f}%)"
+            if size_before > 0
+            else ""
+        )
+        return
 
     # All config from env (see .env.example)
     args.user = os.environ.get("HN_USER")
