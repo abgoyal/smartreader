@@ -1888,7 +1888,7 @@ class ZipStaticFiles:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return
-        path = scope["path"].lstrip("/static/")
+        path = scope["path"].removeprefix("/static/")
         if not path:
             path = "index.html"
 
