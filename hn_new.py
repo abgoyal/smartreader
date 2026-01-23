@@ -384,7 +384,41 @@ class Database:
         conn.executescript(SCHEMA)
         # Migrations for existing databases
         self._migrate_add_front_page_columns()
+        self._migrate_add_teaser_column()
         conn.commit()
+
+    def _migrate_add_teaser_column(self):
+        """Add teaser column if it doesn't exist, populate from existing content."""
+        try:
+            self.execute("SELECT teaser FROM stories LIMIT 1")
+        except sqlite3.OperationalError:
+            log.info("Adding teaser column to stories table...")
+            self.execute("ALTER TABLE stories ADD COLUMN teaser TEXT")
+            # Populate teasers for existing content (in batches to avoid memory issues)
+            log.info("Populating teasers for existing stories...")
+            populated = 0
+            while True:
+                rows = self.fetchall(
+                    """
+                    SELECT id, content FROM stories
+                    WHERE content IS NOT NULL AND content != '' AND teaser IS NULL
+                    LIMIT 100
+                    """
+                )
+                if not rows:
+                    break
+                for row in rows:
+                    content = decompress_content(row["content"])
+                    teaser = content[:TEASER_LENGTH].strip()
+                    if len(content) > TEASER_LENGTH:
+                        teaser += "..."
+                    self.execute(
+                        "UPDATE stories SET teaser = ? WHERE id = ?",
+                        (teaser, row["id"]),
+                    )
+                    populated += 1
+                self.commit()
+            log.info(f"Populated {populated} teasers")
 
     def _migrate_add_front_page_columns(self):
         """Add hit_front_page and front_page_rank columns if they don't exist."""
@@ -468,13 +502,31 @@ class Database:
             )
 
     def get_stories(
-        self, include_dismissed: bool = False, include_blocked: bool = False
-    ) -> list[dict]:
-        """Get stories with computed scores, filtering, and deduplication."""
+        self,
+        dismissed_only: bool = False,
+        include_blocked: bool = False,
+        include_read_later: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Get stories with computed scores, filtering, and deduplication.
+
+        Args:
+            dismissed_only: If True, show ONLY dismissed stories. If False, exclude dismissed.
+            include_blocked: If True, include stories from blocked domains.
+            include_read_later: If True, include stories marked for read later.
+            limit: Max number of stories to return.
+            offset: Number of stories to skip (for pagination).
+
+        Returns:
+            dict with 'stories' list and 'has_more' boolean.
+        """
+        # Select only needed columns (no content - it's fetched on demand)
         query = """
             WITH scored AS (
                 SELECT
-                    s.*,
+                    s.id, s.title, s.url, s.domain, s.by, s.time, s.score, s.descendants,
+                    s.content_status, s.teaser, s.hit_front_page, s.front_page_rank, s.text,
                     COALESCE(md.weight, 0) as domain_merit,
                     COALESCE(dd.weight, 0) as domain_demerit,
                     CASE WHEN rl.story_id IS NOT NULL THEN 1 ELSE 0 END as is_read_later,
@@ -492,10 +544,15 @@ class Database:
             SELECT * FROM scored
             WHERE 1=1
         """
-        if not include_dismissed:
+        # Exclusive filter: show ONLY dismissed OR ONLY non-dismissed
+        if dismissed_only:
+            query += " AND is_dismissed = 1"
+        else:
             query += " AND is_dismissed = 0"
         if not include_blocked:
             query += " AND is_domain_blocked = 0"
+        if not include_read_later:
+            query += " AND is_read_later = 0"
 
         query += " ORDER BY time DESC"
 
@@ -518,10 +575,6 @@ class Database:
 
         for row in rows:
             story = dict(row)
-
-            # Decompress content if compressed
-            if story.get("content"):
-                story["content"] = decompress_content(story["content"])
 
             # Skip blocked words in title
             title_lower = story["title"].lower()
@@ -546,17 +599,14 @@ class Database:
             story["demerit_score"] = story["domain_demerit"] + word_demerit
             story["net_score"] = story["merit_score"] - story["demerit_score"]
 
-            # Generate teaser from content
-            if story.get("content"):
-                story["teaser"] = story["content"][:TEASER_LENGTH].strip()
-                if len(story["content"]) > TEASER_LENGTH:
-                    story["teaser"] += "..."
-            else:
-                story["teaser"] = None
-
             stories.append(story)
 
-        return stories
+        # Apply pagination after filtering/deduplication
+        total = len(stories)
+        paginated = stories[offset : offset + limit]
+        has_more = offset + limit < total
+
+        return {"stories": paginated, "has_more": has_more, "total": total}
 
     def update_content(
         self,
@@ -566,13 +616,22 @@ class Database:
         source: str = None,
         browser_ms: float = 0,
     ):
+        # Generate teaser from content
+        teaser = None
+        if content:
+            # Content may be compressed, decompress to generate teaser
+            text = decompress_content(content) if content.startswith(COMPRESS_PREFIX) else content
+            teaser = text[:TEASER_LENGTH].strip()
+            if len(text) > TEASER_LENGTH:
+                teaser += "..."
+
         self.execute(
             """
             UPDATE stories SET content = ?, content_status = ?, content_source = ?,
-                browser_ms = ?, updated_at = CURRENT_TIMESTAMP
+                browser_ms = ?, teaser = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
         """,
-            (content, status, source, browser_ms, story_id),
+            (content, status, source, browser_ms, teaser, story_id),
         )
         self.commit()
 
@@ -877,19 +936,68 @@ class Database:
         self.execute("DELETE FROM read_later WHERE story_id = ?", (story_id,))
         self.commit()
 
-    def get_read_later(self) -> list[dict]:
-        rows = self.fetchall("""
-            SELECT s.* FROM stories s
+    def get_read_later(self, dismissed_only: bool = False, limit: int = 50, offset: int = 0) -> dict:
+        """Get read later stories.
+
+        Args:
+            dismissed_only: If True, show ONLY dismissed read later stories.
+                           If False, exclude dismissed ones.
+            limit: Max number of stories to return.
+            offset: Number of stories to skip (for pagination).
+
+        Returns:
+            dict with 'stories' list and 'has_more' boolean.
+        """
+        # Select columns with merit/demerit domain scores
+        query = """
+            SELECT s.id, s.title, s.url, s.domain, s.by, s.time, s.score, s.descendants,
+                s.content_status, s.teaser, s.hit_front_page, s.front_page_rank, s.text,
+                COALESCE(md.weight, 0) as domain_merit,
+                COALESCE(dd.weight, 0) as domain_demerit,
+                1 as is_read_later,
+                CASE WHEN d.story_id IS NOT NULL THEN 1 ELSE 0 END as is_dismissed,
+                CASE WHEN h.story_id IS NOT NULL THEN 1 ELSE 0 END as is_read
+            FROM stories s
             JOIN read_later rl ON s.id = rl.story_id
-            ORDER BY rl.created_at DESC
-        """)
+            LEFT JOIN dismissed d ON s.id = d.story_id
+            LEFT JOIN history h ON s.id = h.story_id
+            LEFT JOIN merit_domains md ON s.domain = md.domain
+            LEFT JOIN demerit_domains dd ON s.domain = dd.domain
+        """
+        # Exclusive filter: show ONLY dismissed OR ONLY non-dismissed
+        if dismissed_only:
+            query += " WHERE d.story_id IS NOT NULL"
+        else:
+            query += " WHERE d.story_id IS NULL"
+        query += " ORDER BY rl.created_at DESC"
+
+        rows = self.fetchall(query)
+
+        # Get merit/demerit words for scoring
+        merit_words = {w["word"].lower(): w["weight"] for w in self.get_merit_words()}
+        demerit_words = {w["word"].lower(): w["weight"] for w in self.get_demerit_words()}
+
         stories = []
-        for r in rows:
-            story = dict(r)
-            if story.get("content"):
-                story["content"] = decompress_content(story["content"])
+        for row in rows:
+            story = dict(row)
+            title_lower = story["title"].lower()
+
+            # Compute word-based merit/demerit scores
+            word_merit = sum(w for word, w in merit_words.items() if word in title_lower)
+            word_demerit = sum(w for word, w in demerit_words.items() if word in title_lower)
+
+            story["merit_score"] = story["domain_merit"] + word_merit
+            story["demerit_score"] = story["domain_demerit"] + word_demerit
+            story["net_score"] = story["merit_score"] - story["demerit_score"]
+
             stories.append(story)
-        return stories
+
+        # Apply pagination
+        total = len(stories)
+        paginated = stories[offset : offset + limit]
+        has_more = offset + limit < total
+
+        return {"stories": paginated, "has_more": has_more, "total": total}
 
     # --- Dismissed ---
 
@@ -897,8 +1005,8 @@ class Database:
         self.execute(
             "INSERT OR IGNORE INTO dismissed (story_id) VALUES (?)", (story_id,)
         )
-        # Also remove from read_later so it follows the normal dismiss cleanup cycle
-        self.execute("DELETE FROM read_later WHERE story_id = ?", (story_id,))
+        # Story stays in read_later (if present) until cleanup runs after 24 hours.
+        # This allows dismissed read later stories to remain visible with "show dismissed".
         self.commit()
 
     def undismiss_story(self, story_id: int):
@@ -2483,13 +2591,16 @@ async def index(request: Request):
 
 @app.get("/api/stories")
 async def get_stories(
-    include_dismissed: bool = False,
+    dismissed_only: bool = False,
     include_blocked: bool = False,
+    include_read_later: bool = False,
     read_later_only: bool = False,
+    limit: int = 50,
+    offset: int = 0,
 ):
     if read_later_only:
-        return db.get_read_later()
-    return db.get_stories(include_dismissed, include_blocked)
+        return db.get_read_later(dismissed_only, limit=limit, offset=offset)
+    return db.get_stories(dismissed_only, include_blocked, include_read_later, limit=limit, offset=offset)
 
 
 @app.get("/api/story/{story_id}")
@@ -2644,8 +2755,8 @@ async def remove_demerit_domain(domain: str = Query(...)):
 
 
 @app.get("/api/readlater")
-async def get_read_later():
-    return db.get_read_later()
+async def get_read_later(dismissed_only: bool = False, limit: int = 50, offset: int = 0):
+    return db.get_read_later(dismissed_only, limit=limit, offset=offset)
 
 
 @app.post("/api/readlater/{story_id}")
@@ -2744,9 +2855,12 @@ async def batch_requests(request: Request):
             path = req.get("path", "")
 
             # Route to appropriate handler based on path pattern
-            if path.startswith("/api/dismiss/") and method == "POST":
+            if path.startswith("/api/dismiss/"):
                 story_id = int(path.split("/")[-1])
-                db.dismiss_story(story_id)
+                if method == "POST":
+                    db.dismiss_story(story_id)
+                elif method == "DELETE":
+                    db.undismiss_story(story_id)
             elif path.startswith("/api/readlater/"):
                 story_id = int(path.split("/")[-1])
                 if method == "POST":

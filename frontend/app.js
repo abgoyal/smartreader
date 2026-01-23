@@ -7,6 +7,13 @@ let selectedIndex = -1;
 let currentView = 'all';
 let statusPollInterval = null;
 
+// Pagination state
+let hasMore = false;
+let currentOffset = 0;
+let isLoadingMore = false;
+const PAGE_SIZE = 50;
+const MAX_DOM_ELEMENTS = 200; // Remove old elements when exceeding this
+
 // =============================================================================
 // Cached DOM elements (reduces repeated queries)
 // =============================================================================
@@ -34,29 +41,179 @@ const dom = {
 
 const batcher = {
     queue: [],
+    inflight: [],
     timeout: null,
+    retryTimeout: null,
+    waitingForOnline: false,
     DELAY: 150, // ms to wait before sending batch
+    RETRY_DELAY: 2000, // ms to wait before retry
+    MAX_RETRIES: 3,
+    MAX_BATCH_SIZE: 50, // Split large queues into chunks
+    STORAGE_KEY: 'hn_pending_batch',
+    retryCount: 0,
+
+    // Persist queue to localStorage for survival across page reloads
+    _persist() {
+        const pending = [...this.inflight, ...this.queue];
+        if (pending.length > 0) {
+            localStorage.setItem(this.STORAGE_KEY, JSON.stringify(pending));
+        } else {
+            localStorage.removeItem(this.STORAGE_KEY);
+        }
+    },
+
+    // Load any pending items from previous session
+    _restore() {
+        try {
+            const stored = localStorage.getItem(this.STORAGE_KEY);
+            if (stored) {
+                const items = JSON.parse(stored);
+                if (Array.isArray(items) && items.length > 0) {
+                    console.log(`Restored ${items.length} pending batch items from previous session`);
+                    this.queue = items;
+                    // Don't clear storage yet - wait for successful flush
+                    // Schedule flush
+                    if (!this.timeout) {
+                        this.timeout = setTimeout(() => this.flush(), this.DELAY);
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('Failed to restore batch queue:', e);
+            localStorage.removeItem(this.STORAGE_KEY);
+        }
+    },
 
     add(method, path) {
         this.queue.push({ method, path });
+        this._persist();
         if (!this.timeout) {
             this.timeout = setTimeout(() => this.flush(), this.DELAY);
         }
     },
 
-    flush() {
-        this.timeout = null;
-        if (this.queue.length === 0) return;
+    flush(useBeacon = false) {
+        if (this.timeout) {
+            clearTimeout(this.timeout);
+            this.timeout = null;
+        }
+        if (this.retryTimeout) {
+            clearTimeout(this.retryTimeout);
+            this.retryTimeout = null;
+        }
 
-        const batch = this.queue;
+        if (this.queue.length === 0 && this.inflight.length === 0) return;
+
+        // If offline, wait for online event instead of burning retries
+        if (!navigator.onLine && !useBeacon) {
+            // Move queue to inflight to preserve order
+            if (this.queue.length > 0) {
+                this.inflight = [...this.inflight, ...this.queue];
+                this.queue = [];
+                this._persist();
+            }
+            if (!this.waitingForOnline) {
+                this.waitingForOnline = true;
+                console.log(`Offline - holding ${this.inflight.length} items until online`);
+            }
+            return;
+        }
+        this.waitingForOnline = false;
+
+        // Combine queue with any failed inflight items being retried
+        const allItems = [...this.inflight, ...this.queue];
         this.queue = [];
 
-        // Send batch request
+        // Split into batches if too large
+        const batch = allItems.slice(0, this.MAX_BATCH_SIZE);
+        this.inflight = batch; // Current batch being sent
+
+        // Put overflow back in queue for next flush
+        if (allItems.length > this.MAX_BATCH_SIZE) {
+            this.queue = allItems.slice(this.MAX_BATCH_SIZE);
+        }
+
+        // Persist current state in case of crash/close during request
+        this._persist();
+
+        const body = JSON.stringify({ requests: batch });
+
+        // Use sendBeacon for page unload (best-effort, can't retry)
+        if (useBeacon && navigator.sendBeacon) {
+            // For unload, try to send everything in one shot
+            const allBody = JSON.stringify({ requests: [...batch, ...this.queue] });
+            const sent = navigator.sendBeacon('/api/batch', new Blob([allBody], { type: 'application/json' }));
+            if (sent) {
+                // Beacon queued successfully - clear state and storage
+                this.inflight = [];
+                this.queue = [];
+                this.retryCount = 0;
+                localStorage.removeItem(this.STORAGE_KEY);
+            }
+            // If sendBeacon returns false (queue full), items remain in localStorage
+            // and will be retried on next page load
+            return;
+        }
+
         fetch('/api/batch', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ requests: batch })
-        }).catch(e => console.error('Batch request failed:', e));
+            body
+        })
+        .then(res => {
+            if (res.ok) {
+                // Success - clear inflight and update persistence
+                this.inflight = [];
+                this.retryCount = 0;
+                this._persist(); // Clears storage if queue is also empty
+                // If there's overflow in queue, schedule next batch
+                if (this.queue.length > 0) {
+                    this.timeout = setTimeout(() => this.flush(), 50);
+                }
+            } else if (res.status >= 400 && res.status < 500) {
+                // Client error (4xx) - items are corrupt, drop them
+                console.error('Batch rejected by server (4xx), dropping items:', this.inflight.length);
+                this.inflight = [];
+                this.retryCount = 0;
+                this._persist();
+            } else {
+                // Server error (5xx) - will retry
+                throw new Error(`HTTP ${res.status}`);
+            }
+        })
+        .catch(e => {
+            console.error('Batch request failed:', e);
+
+            // If we went offline during request, wait for online
+            if (!navigator.onLine) {
+                this.waitingForOnline = true;
+                console.log(`Went offline - holding ${this.inflight.length + this.queue.length} items`);
+                return;
+            }
+
+            // Retry with backoff if under limit
+            if (this.retryCount < this.MAX_RETRIES) {
+                this.retryCount++;
+                const delay = this.RETRY_DELAY * this.retryCount;
+                console.log(`Retrying batch in ${delay}ms (attempt ${this.retryCount}/${this.MAX_RETRIES})`);
+                this.retryTimeout = setTimeout(() => this.flush(), delay);
+            } else {
+                // Give up for now - items stay in localStorage for next session
+                console.error('Batch failed after max retries, will retry on next page load:', this.inflight.length, 'items');
+                // Don't clear inflight - _persist() already saved them
+                // Just reset retry count so we don't block new items
+                this.retryCount = 0;
+            }
+        });
+    },
+
+    // Called when coming back online
+    onOnline() {
+        if (this.waitingForOnline && (this.inflight.length > 0 || this.queue.length > 0)) {
+            console.log(`Back online - flushing ${this.inflight.length + this.queue.length} held items`);
+            this.retryCount = 0; // Fresh start
+            this.flush();
+        }
     },
 
     // For critical single requests (non-batched)
@@ -132,7 +289,19 @@ const activityStats = {
 // =============================================================================
 
 function getVisibleStoryElements() {
-    return Array.from(dom.storyList.querySelectorAll('.story')).filter(el => el.style.display !== 'none');
+    const listEl = currentView === 'readlater' ? dom.readlaterList : dom.storyList;
+    return Array.from(listEl.querySelectorAll('.story')).filter(el => el.style.display !== 'none');
+}
+
+// Fix selectedIndex to match the visually selected story's position
+function syncSelectedIndex() {
+    const visible = getVisibleStoryElements();
+    const selectedEl = visible.find(el => el.classList.contains('selected'));
+    if (selectedEl) {
+        selectedIndex = visible.indexOf(selectedEl);
+    } else {
+        selectedIndex = visible.length > 0 ? 0 : -1;
+    }
 }
 
 // =============================================================================
@@ -189,7 +358,7 @@ function formatTime(timestamp) {
     return date.toLocaleDateString();
 }
 
-function renderStory(story, index) {
+function renderStory(story) {
     const titleLower = story.title.toLowerCase();
 
     // Detect story type badges
@@ -210,10 +379,10 @@ function renderStory(story, index) {
         scoreHtml = `<span class="score-indicator negative">${story.net_score}</span>`;
     }
 
-    // Teaser - render as markdown
+    // Teaser - render as markdown (use safe renderer to prevent XSS)
     let teaserHtml = '';
     if (story.teaser) {
-        const renderedTeaser = marked.parse(story.teaser);
+        const renderedTeaser = renderMarkdown(story.teaser);
         teaserHtml = `<div class="story-teaser" onclick="expandContent(${story.id})">${renderedTeaser}</div>`;
     } else if (story.content_status === 'pending' || story.content_status === 'fetching') {
         teaserHtml = `<div class="story-teaser loading">Loading content...</div>`;
@@ -228,7 +397,7 @@ function renderStory(story, index) {
     const hnLink = `https://news.ycombinator.com/item?id=${story.id}`;
 
     return `
-        <li class="${classes.join(' ')}" data-id="${story.id}" data-index="${index}">
+        <li class="${classes.join(' ')}" data-id="${story.id}">
             <div class="story-header">
                 <div class="story-main">
                     <div class="story-title">
@@ -268,7 +437,7 @@ function renderStory(story, index) {
     `;
 }
 
-function renderStories() {
+function renderStories(reset = true) {
     if (stories.length === 0) {
         dom.storyList.innerHTML = '<li class="empty-msg">No stories found</li>';
         updateStoryCount();
@@ -309,7 +478,42 @@ function renderStories() {
         return;
     }
 
-    dom.storyList.innerHTML = sortedStories.map((s, i) => renderStory(s, i)).join('');
+    // Get existing story IDs in DOM for append mode
+    const existingDomIds = new Set();
+    if (!reset) {
+        dom.storyList.querySelectorAll('.story').forEach(el => {
+            existingDomIds.add(parseInt(el.dataset.id));
+        });
+    }
+
+    if (reset) {
+        // Full re-render
+        dom.storyList.innerHTML = sortedStories.map(renderStory).join('');
+    } else {
+        // Append only new stories
+        const newStories = sortedStories.filter(s => !existingDomIds.has(s.id));
+        if (newStories.length > 0) {
+            // Remove loading indicator if present
+            const loadingIndicator = dom.storyList.querySelector('.loading-more');
+            if (loadingIndicator) loadingIndicator.remove();
+
+            // Append new stories
+            const fragment = document.createDocumentFragment();
+            const temp = document.createElement('div');
+            temp.innerHTML = newStories.map(renderStory).join('');
+            while (temp.firstChild) {
+                fragment.appendChild(temp.firstChild);
+            }
+            dom.storyList.appendChild(fragment);
+        }
+    }
+
+    // Add loading indicator if more stories available
+    updateLoadingIndicator();
+
+    // Memory management: remove old DOM elements when list gets too long
+    trimOldStories();
+
     updateStoryCount();
 
     // Restore expanded state
@@ -324,56 +528,164 @@ function renderStories() {
     }
 
     // Restore selection by story ID (position may have changed due to sort)
-    if (selectedStoryId !== null) {
-        const visibleStories = getVisibleStoryElements();
+    const visibleStories = getVisibleStoryElements();
+    if (selectedStoryId != null) {
         const newIndex = visibleStories.findIndex(el => parseInt(el.dataset.id) === selectedStoryId);
         if (newIndex >= 0) {
             selectStory(newIndex);
-        } else {
+        } else if (visibleStories.length > 0) {
             selectStory(0); // Fallback to first
         }
+    } else if (visibleStories.length > 0) {
+        // Initial load - select first story
+        selectStory(0);
     }
+}
+
+function updateLoadingIndicator() {
+    // Remove existing indicator
+    const existing = dom.storyList.querySelector('.loading-more');
+    if (existing) existing.remove();
+
+    // Add indicator if more stories available
+    if (hasMore && currentView === 'all') {
+        const indicator = document.createElement('li');
+        indicator.className = 'loading-more';
+        indicator.innerHTML = '<span>Loading more stories...</span>';
+        indicator.style.cssText = 'text-align: center; padding: 20px; color: var(--text-muted); display: none;';
+        dom.storyList.appendChild(indicator);
+    }
+
+    // Re-observe for infinite scroll
+    observeLoadingIndicator();
+}
+
+function trimOldStories() {
+    const storyElements = dom.storyList.querySelectorAll('.story');
+    if (storyElements.length <= MAX_DOM_ELEMENTS) return;
+
+    // Remove from top of DOM (what user has scrolled past) to free memory
+    const toRemove = storyElements.length - MAX_DOM_ELEMENTS;
+    for (let i = 0; i < toRemove; i++) {
+        const el = storyElements[i];
+        // Don't remove selected story
+        if (el.classList.contains('selected')) continue;
+        el.remove();
+    }
+
+    // Adjust selectedIndex if needed
+    syncSelectedIndex();
 }
 
 // =============================================================================
 // Data Loading
 // =============================================================================
 
-async function loadStories() {
-    const showDismissed = document.getElementById('show-dismissed').checked;
+async function loadStories(reset = true) {
+    const dismissedOnly = document.getElementById('show-dismissed').checked;
     const showBlocked = document.getElementById('show-blocked').checked;
 
-    // Show loading state
-    if (stories.length === 0) {
+    if (reset) {
+        currentOffset = 0;
+        stories = [];
+        hasMore = false; // Reset until we get fresh data from API
+        // Show loading state only on initial load
         dom.storyList.innerHTML = '<li class="loading-msg">Loading stories...</li>';
     }
 
     try {
-        stories = await api.get(`/api/stories?include_dismissed=${showDismissed}&include_blocked=${showBlocked}`);
-        renderStories();
-        // Select first story by default
-        if (stories.length > 0) {
-            selectStory(0);
+        const result = await api.get(`/api/stories?dismissed_only=${dismissedOnly}&include_blocked=${showBlocked}&limit=${PAGE_SIZE}&offset=${currentOffset}`);
+
+        if (reset) {
+            stories = result.stories;
         } else {
-            selectedIndex = -1;
+            // Append new stories, avoiding duplicates
+            const existingIds = new Set(stories.map(s => s.id));
+            const newStories = result.stories.filter(s => !existingIds.has(s.id));
+            stories = stories.concat(newStories);
         }
+
+        hasMore = result.has_more;
+        currentOffset = stories.length;
+
+        // renderStories() handles state preservation (selection, expanded content, scroll)
+        renderStories(reset);
     } catch (e) {
-        dom.storyList.innerHTML = '<li class="error-msg">Failed to load stories. Pull down to retry.</li>';
+        if (reset) {
+            dom.storyList.innerHTML = '<li class="error-msg">Failed to load stories. Pull down to retry.</li>';
+        }
         showToast('Failed to load stories: ' + e.message);
     }
 }
 
-async function loadReadLater() {
-    try {
-        const items = await api.get('/api/readlater');
-        const empty = document.getElementById('readlater-empty');
+async function loadMoreStories() {
+    if (!hasMore || isLoadingMore) return;
 
-        if (items.length === 0) {
+    isLoadingMore = true;
+    try {
+        await loadStories(false);
+    } finally {
+        isLoadingMore = false;
+    }
+}
+
+async function loadReadLater() {
+    const dismissedOnly = document.getElementById('show-dismissed').checked;
+    const frontPageOnly = document.getElementById('front-page-only').checked;
+    const sortOldest = document.getElementById('sort-oldest').checked;
+    const empty = document.getElementById('readlater-empty');
+
+    // Track current state before reload
+    const selectedStoryId = getSelectedStory()?.id;
+    const expandedIds = new Set();
+    dom.readlaterList.querySelectorAll('.story-content.expanded').forEach(el => {
+        const match = el.id.match(/content-(\d+)/);
+        if (match) expandedIds.add(parseInt(match[1]));
+    });
+
+    try {
+        // Read later list is typically small, load all at once
+        const result = await api.get(`/api/readlater?dismissed_only=${dismissedOnly}&limit=500`);
+        const items = result.stories;
+
+        // Apply same filters as All view
+        let filtered = frontPageOnly ? items.filter(s => s.hit_front_page) : items;
+        const sorted = [...filtered].sort((a, b) => sortOldest ? a.time - b.time : b.time - a.time);
+
+        // Store in stories array for keyboard navigation
+        stories = sorted;
+
+        if (sorted.length === 0) {
             dom.readlaterList.innerHTML = '';
             empty.style.display = 'block';
+            selectedIndex = -1;
         } else {
             empty.style.display = 'none';
-            dom.readlaterList.innerHTML = items.map((s, i) => renderStory(s, i)).join('');
+            dom.readlaterList.innerHTML = sorted.map(renderStory).join('');
+
+            // Restore expanded state for stories that still exist
+            for (const storyId of expandedIds) {
+                const story = stories.find(s => s.id === storyId);
+                const contentEl = document.getElementById(`content-${storyId}`);
+                if (contentEl && story?.content) {
+                    contentEl.innerHTML = renderMarkdown(story.content);
+                    contentEl.classList.add('expanded');
+                    contentEl.dataset.loaded = 'true';
+                }
+            }
+
+            // Restore selection or select first
+            if (selectedStoryId != null) {
+                const visibleStories = getVisibleStoryElements();
+                const newIndex = visibleStories.findIndex(el => parseInt(el.dataset.id) === selectedStoryId);
+                if (newIndex >= 0) {
+                    selectStory(newIndex);
+                } else {
+                    selectStory(0);
+                }
+            } else {
+                selectStory(0);
+            }
         }
     } catch (e) {
         showToast('Failed to load read later: ' + e.message);
@@ -541,35 +853,72 @@ function initTagDelegation() {
 async function toggleReadLater(storyId) {
     const story = stories.find(s => s.id === storyId);
     const el = document.querySelector(`.story[data-id="${storyId}"]`);
+    // In readlater view, all visible stories are read later by definition
+    const wasReadLater = currentView === 'readlater' ? true : story?.is_read_later;
+    const wasSelected = el && el.classList.contains('selected');
 
     // Optimistic update
     if (story) {
         story.is_read_later = !story.is_read_later;
-        if (el) {
-            // Update desktop button
-            const btn = el.querySelector('.action-btn.readlater-btn');
-            if (btn) {
-                btn.textContent = story.is_read_later ? '★' : '☆';
-                btn.classList.toggle('active', story.is_read_later);
+    }
+
+    // Hide story from current view when it no longer belongs
+    // - In 'all' view: hide when added to read later
+    // - In 'readlater' view: hide when removed from read later (always, since wasReadLater=true)
+    const nowReadLater = story ? story.is_read_later : !wasReadLater;
+    const shouldHide = (currentView === 'all' && nowReadLater) ||
+                       (currentView === 'readlater' && !nowReadLater);
+
+    if (shouldHide && el) {
+        el.style.display = 'none';
+
+        // Get visible elements and handle selection/empty state
+        const listEl = currentView === 'readlater' ? dom.readlaterList : dom.storyList;
+        const visible = Array.from(listEl.querySelectorAll('.story')).filter(e => e.style.display !== 'none');
+
+        if (visible.length === 0) {
+            // Show empty state
+            selectedIndex = -1;
+            if (currentView === 'readlater') {
+                document.getElementById('readlater-empty').style.display = 'block';
             }
-            // Update mobile save button
-            const mobileBtn = el.querySelector('.action-zone.save');
-            if (mobileBtn) {
-                mobileBtn.textContent = story.is_read_later ? '★' : '☆';
-                mobileBtn.classList.toggle('active', story.is_read_later);
+        } else if (wasSelected) {
+            // Reselect next story
+            if (selectedIndex >= visible.length) {
+                selectedIndex = Math.max(0, visible.length - 1);
             }
+            selectStory(selectedIndex);
+        } else {
+            // Sync selectedIndex with visually selected story (may have shifted)
+            syncSelectedIndex();
+        }
+        if (currentView === 'all') {
+            updateStoryCount();
+        }
+    } else if (el) {
+        // Just update buttons (only in all view since it stays visible there)
+        const newState = story ? story.is_read_later : nowReadLater;
+        const btn = el.querySelector('.action-btn.readlater-btn');
+        if (btn) {
+            btn.textContent = newState ? '★' : '☆';
+            btn.classList.toggle('active', newState);
+        }
+        const mobileBtn = el.querySelector('.action-zone.save');
+        if (mobileBtn) {
+            mobileBtn.textContent = newState ? '★' : '☆';
+            mobileBtn.classList.toggle('active', newState);
         }
     }
 
-    // Background API call (fire-and-forget with error handling)
-    if (story && !story.is_read_later) {
-        batcher.add('DELETE', `/api/readlater/${storyId}`);
-        showToast('Removed from read later');
-    } else {
+    // Background API call
+    if (!wasReadLater) {
         batcher.add('POST', `/api/readlater/${storyId}`);
-        showToast('Added to read later');
+        showToast('Saved for later');
         activityStats.log('save');
         updateActivityStats();
+    } else {
+        batcher.add('DELETE', `/api/readlater/${storyId}`);
+        showToast('Removed from read later');
     }
     hapticFeedback('light');
 }
@@ -584,19 +933,33 @@ async function dismissStory(storyId) {
         el.style.display = 'none';
     }
 
-    // Remove from local stories array
+    // Remove from local stories array (only applies in 'all' view)
     const idx = stories.findIndex(s => s.id === storyId);
     if (idx !== -1) stories.splice(idx, 1);
 
-    // Only reselect/scroll if we dismissed the selected story (keyboard nav)
-    if (wasDismissingSelected) {
-        const visible = getVisibleStoryElements();
+    // Get visible elements and handle selection/empty state
+    const listEl = currentView === 'readlater' ? dom.readlaterList : dom.storyList;
+    const visible = Array.from(listEl.querySelectorAll('.story')).filter(e => e.style.display !== 'none');
+
+    if (visible.length === 0) {
+        // Show empty state
+        selectedIndex = -1;
+        if (currentView === 'readlater') {
+            document.getElementById('readlater-empty').style.display = 'block';
+        }
+    } else if (wasDismissingSelected) {
+        // Reselect next story
         if (selectedIndex >= visible.length) {
             selectedIndex = Math.max(0, visible.length - 1);
         }
         selectStory(selectedIndex);
+    } else {
+        // Sync selectedIndex with visually selected story (may have shifted)
+        syncSelectedIndex();
     }
-    updateStoryCount();
+    if (currentView === 'all') {
+        updateStoryCount();
+    }
 
     // Batched API call (fire-and-forget)
     batcher.add('POST', `/api/dismiss/${storyId}`);
@@ -607,30 +970,58 @@ async function dismissStory(storyId) {
 }
 
 async function undismissStory(storyId) {
-    const story = stories.find(s => s.id === storyId);
-    if (!story) return;
+    // In "dismissed only" mode, undismissing should hide the story (it's no longer dismissed)
+    const el = document.querySelector(`.story[data-id="${storyId}"]`);
+    const wasSelected = el && el.classList.contains('selected');
+    const dismissedOnly = document.getElementById('show-dismissed').checked;
 
-    // Optimistic update
-    story.is_dismissed = false;
-    renderStories();
+    // Optimistic update - hide immediately in "dismissed only" mode
+    if (dismissedOnly && el) {
+        el.style.display = 'none';
 
-    try {
-        await api.delete(`/api/dismiss/${storyId}`);
-        showToast('Restored');
-        hapticFeedback('light');
-    } catch (e) {
-        // Revert on failure
-        story.is_dismissed = true;
-        renderStories();
-        showToast('Failed to restore: ' + e.message);
+        // Get visible elements and handle selection/empty state
+        const listEl = currentView === 'readlater' ? dom.readlaterList : dom.storyList;
+        const visible = Array.from(listEl.querySelectorAll('.story')).filter(e => e.style.display !== 'none');
+
+        if (visible.length === 0) {
+            // Show empty state
+            selectedIndex = -1;
+            if (currentView === 'readlater') {
+                document.getElementById('readlater-empty').style.display = 'block';
+            }
+        } else if (wasSelected) {
+            // Reselect next story
+            if (selectedIndex >= visible.length) {
+                selectedIndex = Math.max(0, visible.length - 1);
+            }
+            selectStory(selectedIndex);
+        } else {
+            // Sync selectedIndex with visually selected story (may have shifted)
+            syncSelectedIndex();
+        }
+        if (currentView === 'all') {
+            updateStoryCount();
+        }
     }
+
+    // Update local state if story is in array
+    const story = stories.find(s => s.id === storyId);
+    if (story) {
+        story.is_dismissed = false;
+    }
+
+    // API call
+    batcher.add('DELETE', `/api/dismiss/${storyId}`);
+    showToast('Restored');
+    hapticFeedback('light');
 }
 
 async function blockDomain(domain) {
     if (!domain) return;
 
     // Optimistic update - hide all stories from this domain immediately
-    dom.storyList.querySelectorAll('.story').forEach(el => {
+    const listEl = currentView === 'readlater' ? dom.readlaterList : dom.storyList;
+    listEl.querySelectorAll('.story').forEach(el => {
         const story = stories.find(s => s.id === parseInt(el.dataset.id));
         if (story && story.domain === domain) {
             el.style.display = 'none';
@@ -640,13 +1031,21 @@ async function blockDomain(domain) {
     // Remove from local array
     stories = stories.filter(s => s.domain !== domain);
 
-    // Keep selection in bounds and reselect
+    // Handle selection/empty state
     const visible = getVisibleStoryElements();
-    if (selectedIndex >= visible.length) {
-        selectedIndex = Math.max(0, visible.length - 1);
+    if (visible.length === 0) {
+        selectedIndex = -1;
+        if (currentView === 'readlater') {
+            document.getElementById('readlater-empty').style.display = 'block';
+        }
+    } else {
+        // Reselect - blocked domain may have included selected story
+        syncSelectedIndex();
+        selectStory(selectedIndex);
     }
-    selectStory(selectedIndex);
-    updateStoryCount();
+    if (currentView === 'all') {
+        updateStoryCount();
+    }
 
     // Batched API call (fire-and-forget)
     batcher.add('POST', `/api/blocked/domains?domain=${encodeURIComponent(domain)}`);
@@ -684,7 +1083,7 @@ async function markOpened(storyId) {
     }
 }
 
-async function expandContent(storyId) {
+async function expandContent(storyId, { skipLog = false } = {}) {
     const contentEl = document.getElementById(`content-${storyId}`);
     if (!contentEl) return;
 
@@ -695,9 +1094,11 @@ async function expandContent(storyId) {
         return;
     }
 
-    // Log expand action
-    activityStats.log('expand');
-    updateActivityStats();
+    // Log expand action (skip for auto-expand during navigation)
+    if (!skipLog) {
+        activityStats.log('expand');
+        updateActivityStats();
+    }
 
     // Make focusable for keyboard scrolling
     contentEl.setAttribute('tabindex', '-1');
@@ -712,8 +1113,9 @@ async function expandContent(storyId) {
         return;
     }
 
-    // Load content if not already loaded
-    if (!contentEl.dataset.loaded) {
+    // Load content if not already loaded or loading
+    if (!contentEl.dataset.loaded && !contentEl.dataset.loading) {
+        contentEl.dataset.loading = 'true';
         contentEl.innerHTML = 'Loading...';
         contentEl.classList.add('expanded');
         contentEl.focus();
@@ -734,8 +1136,10 @@ async function expandContent(storyId) {
             contentEl.dataset.loaded = 'true';
         } catch (e) {
             contentEl.innerHTML = '<em>Error loading content</em>';
+        } finally {
+            delete contentEl.dataset.loading;
         }
-    } else {
+    } else if (!contentEl.dataset.loading) {
         contentEl.classList.add('expanded');
         contentEl.focus();
     }
@@ -746,7 +1150,12 @@ async function fetchNewStories() {
         showToast('Fetching new stories...');
         const result = await api.post('/api/fetch');
         showToast(`Fetched ${result.fetched} new stories`);
-        await loadStories();
+        // Reload current view to preserve context
+        if (currentView === 'readlater') {
+            await loadReadLater();
+        } else {
+            await loadStories();
+        }
     } catch (e) {
         showToast('Fetch failed: ' + e.message);
     }
@@ -895,7 +1304,7 @@ async function clearDismissed() {
     try {
         await api.delete('/api/dismiss');
         showToast('Cleared all dismissed stories');
-        await loadStories();
+        reloadCurrentView();
     } catch (e) {
         showToast('Error: ' + e.message);
     }
@@ -931,10 +1340,10 @@ function selectStory(index) {
     if (selected) {
         selected.scrollIntoView({ behavior: 'instant', block: 'nearest' });
 
-        // Auto-expand content for selected story
+        // Auto-expand content for selected story (don't log - it's navigation, not manual expand)
         const storyId = parseInt(selected.dataset.id);
         if (storyId) {
-            expandContent(storyId);
+            expandContent(storyId, { skipLog: true });
         }
     }
 }
@@ -1026,7 +1435,7 @@ function startStatusPolling() {
             lastPending = stats.pending_content;
             lastDone = stats.done_content;
 
-            if (contentChanged && currentView === 'all') {
+            if (contentChanged && (currentView === 'all' || currentView === 'readlater')) {
                 // Fetch only stories with updated content
                 const updates = await api.get('/api/stories/updates');
 
@@ -1044,7 +1453,7 @@ function startStatusPolling() {
                         const storyEl = document.querySelector(`.story[data-id="${update.id}"]`);
                         const teaserEl = storyEl?.querySelector('.story-teaser');
                         if (teaserEl && update.teaser) {
-                            teaserEl.innerHTML = marked.parse(update.teaser);
+                            teaserEl.innerHTML = renderMarkdown(update.teaser);
                             teaserEl.classList.remove('loading');
                         }
                     }
@@ -1110,10 +1519,12 @@ function renderMarkdown(text) {
     return html;
 }
 
+let toastTimeout = null;
 function showToast(message) {
+    if (toastTimeout) clearTimeout(toastTimeout);
     dom.toast.textContent = message;
     dom.toast.classList.add('visible');
-    setTimeout(() => dom.toast.classList.remove('visible'), 2500);
+    toastTimeout = setTimeout(() => dom.toast.classList.remove('visible'), 2500);
 }
 
 function closeModal() {
@@ -1128,20 +1539,22 @@ document.addEventListener('keydown', (e) => {
     // Ignore if typing in input
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
-    const story = getSelectedStory();
+    // Story-related shortcuts only work in All and Read Later views
+    const inStoryView = currentView === 'all' || currentView === 'readlater';
+    const story = inStoryView ? getSelectedStory() : null;
 
     switch (e.key) {
         case 'j':
-            selectStory(selectedIndex - 1);  // j = up visually
+            if (inStoryView) selectStory(selectedIndex - 1);  // j = up visually
             break;
         case 'k':
-            selectStory(selectedIndex + 1);  // k = down visually
+            if (inStoryView) selectStory(selectedIndex + 1);  // k = down visually
             break;
         case 'o':
-            openSelectedStory();
+            if (inStoryView) openSelectedStory();
             break;
         case 'Enter':
-            openSelectedComments();
+            if (inStoryView) openSelectedComments();
             break;
         case 'e':
             if (story) expandContent(story.id);
@@ -1158,7 +1571,7 @@ document.addEventListener('keydown', (e) => {
             if (story && story.domain) blockDomain(story.domain);
             break;
         case 'f':
-            fetchNewStories();
+            if (inStoryView) fetchNewStories();
             break;
         case '1':
             switchView('all');
@@ -1188,11 +1601,32 @@ document.querySelectorAll('.tab').forEach(tab => {
     tab.addEventListener('click', () => switchView(tab.dataset.view));
 });
 
-// Filter checkboxes
-document.getElementById('show-dismissed').addEventListener('change', loadStories);
-document.getElementById('show-blocked').addEventListener('change', loadStories);
-document.getElementById('front-page-only').addEventListener('change', renderStories);
-document.getElementById('sort-oldest').addEventListener('change', renderStories);
+// Filter checkboxes - most filters affect both views
+function reloadCurrentView() {
+    if (currentView === 'readlater') {
+        loadReadLater();
+    } else {
+        loadStories();
+    }
+}
+
+document.getElementById('show-dismissed').addEventListener('change', reloadCurrentView);
+document.getElementById('show-blocked').addEventListener('change', loadStories); // Only affects All view
+document.getElementById('front-page-only').addEventListener('change', () => {
+    // In All view, just re-render (data already loaded). In Read Later, reload.
+    if (currentView === 'readlater') {
+        loadReadLater();
+    } else {
+        renderStories();
+    }
+});
+document.getElementById('sort-oldest').addEventListener('change', () => {
+    if (currentView === 'readlater') {
+        loadReadLater();
+    } else {
+        renderStories();
+    }
+});
 
 // Refresh button
 document.getElementById('btn-refresh').addEventListener('click', fetchNewStories);
@@ -1259,7 +1693,7 @@ function hapticFeedback(type = 'light') {
 
 // Mobile card tap handler - expand content when tapping card body (not links/actions)
 function initMobileCardTap() {
-    dom.storyList.addEventListener('click', (e) => {
+    const handler = (e) => {
         if (!isMobile()) return;
 
         // Ignore clicks on links, buttons, action zones, and teaser (teaser has its own onclick)
@@ -1273,7 +1707,10 @@ function initMobileCardTap() {
         if (storyId) {
             expandContent(storyId);
         }
-    });
+    };
+    // Listen on both story lists
+    dom.storyList.addEventListener('click', handler);
+    dom.readlaterList.addEventListener('click', handler);
 }
 
 function toggleBottomSheet() {
@@ -1334,8 +1771,14 @@ function updateOnlineStatus() {
         showToast('You are offline');
     } else {
         showToast('Back online');
+        // Flush any held batch requests
+        batcher.onOnline();
         // Refresh data when coming back online
-        if (currentView === 'all') loadStories();
+        if (currentView === 'all') {
+            loadStories();
+        } else if (currentView === 'readlater') {
+            loadReadLater();
+        }
     }
 }
 
@@ -1343,13 +1786,58 @@ window.addEventListener('online', updateOnlineStatus);
 window.addEventListener('offline', updateOnlineStatus);
 
 // =============================================================================
+// Infinite Scroll
+// =============================================================================
+
+let infiniteScrollObserver = null;
+let observedIndicator = null;
+
+function initInfiniteScroll() {
+    // Use Intersection Observer for efficient scroll detection
+    infiniteScrollObserver = new IntersectionObserver((entries) => {
+        const entry = entries[0];
+        if (entry && entry.isIntersecting && hasMore && !isLoadingMore && currentView === 'all') {
+            // Show loading indicator
+            const indicator = dom.storyList.querySelector('.loading-more');
+            if (indicator) indicator.style.display = 'block';
+
+            loadMoreStories();
+        }
+    }, {
+        root: null, // viewport
+        rootMargin: '200px', // Load more when within 200px of viewport
+        threshold: 0
+    });
+}
+
+function observeLoadingIndicator() {
+    if (!infiniteScrollObserver) return;
+
+    const indicator = dom.storyList.querySelector('.loading-more');
+
+    // Unobserve previous indicator if it's different (element was recreated)
+    if (observedIndicator && observedIndicator !== indicator) {
+        infiniteScrollObserver.unobserve(observedIndicator);
+        observedIndicator = null;
+    }
+
+    // Observe new indicator
+    if (indicator && indicator !== observedIndicator) {
+        infiniteScrollObserver.observe(indicator);
+        observedIndicator = indicator;
+    }
+}
+
+// =============================================================================
 // Initialize
 // =============================================================================
 
 initTheme();
 dom.init();
+batcher._restore(); // Restore any pending actions from previous session
 initTagDelegation();
 initMobileCardTap();
+initInfiniteScroll();
 loadStories();
 startStatusPolling();
 updateSidebarCfStats();
@@ -1363,12 +1851,12 @@ if (!navigator.onLine) {
 // Cleanup on page unload
 window.addEventListener('beforeunload', () => {
     stopStatusPolling();
-    batcher.flush(); // Send any pending batched requests
+    batcher.flush(true); // Use sendBeacon for guaranteed delivery
 });
 
 // Also flush on visibility change (tab switch/close)
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
-        batcher.flush();
+        batcher.flush(true); // Use sendBeacon for guaranteed delivery
     }
 });
