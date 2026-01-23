@@ -620,7 +620,11 @@ class Database:
         teaser = None
         if content:
             # Content may be compressed, decompress to generate teaser
-            text = decompress_content(content) if content.startswith(COMPRESS_PREFIX) else content
+            text = (
+                decompress_content(content)
+                if content.startswith(COMPRESS_PREFIX)
+                else content
+            )
             teaser = text[:TEASER_LENGTH].strip()
             if len(text) > TEASER_LENGTH:
                 teaser += "..."
@@ -936,7 +940,9 @@ class Database:
         self.execute("DELETE FROM read_later WHERE story_id = ?", (story_id,))
         self.commit()
 
-    def get_read_later(self, dismissed_only: bool = False, limit: int = 50, offset: int = 0) -> dict:
+    def get_read_later(
+        self, dismissed_only: bool = False, limit: int = 50, offset: int = 0
+    ) -> dict:
         """Get read later stories.
 
         Args:
@@ -975,7 +981,9 @@ class Database:
 
         # Get merit/demerit words for scoring
         merit_words = {w["word"].lower(): w["weight"] for w in self.get_merit_words()}
-        demerit_words = {w["word"].lower(): w["weight"] for w in self.get_demerit_words()}
+        demerit_words = {
+            w["word"].lower(): w["weight"] for w in self.get_demerit_words()
+        }
 
         stories = []
         for row in rows:
@@ -983,8 +991,12 @@ class Database:
             title_lower = story["title"].lower()
 
             # Compute word-based merit/demerit scores
-            word_merit = sum(w for word, w in merit_words.items() if word in title_lower)
-            word_demerit = sum(w for word, w in demerit_words.items() if word in title_lower)
+            word_merit = sum(
+                w for word, w in merit_words.items() if word in title_lower
+            )
+            word_demerit = sum(
+                w for word, w in demerit_words.items() if word in title_lower
+            )
 
             story["merit_score"] = story["domain_merit"] + word_merit
             story["demerit_score"] = story["domain_demerit"] + word_demerit
@@ -2600,7 +2612,9 @@ async def get_stories(
 ):
     if read_later_only:
         return db.get_read_later(dismissed_only, limit=limit, offset=offset)
-    return db.get_stories(dismissed_only, include_blocked, include_read_later, limit=limit, offset=offset)
+    return db.get_stories(
+        dismissed_only, include_blocked, include_read_later, limit=limit, offset=offset
+    )
 
 
 @app.get("/api/story/{story_id}")
@@ -2755,7 +2769,9 @@ async def remove_demerit_domain(domain: str = Query(...)):
 
 
 @app.get("/api/readlater")
-async def get_read_later(dismissed_only: bool = False, limit: int = 50, offset: int = 0):
+async def get_read_later(
+    dismissed_only: bool = False, limit: int = 50, offset: int = 0
+):
     return db.get_read_later(dismissed_only, limit=limit, offset=offset)
 
 
