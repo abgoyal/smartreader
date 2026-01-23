@@ -982,6 +982,7 @@ class Database:
 
         if all_ids_to_delete:
             # Delete from child tables FIRST (FK constraint compliance)
+            # Note: dismissed table may have FK on older databases (before schema change)
             placeholders = ",".join("?" * len(all_ids_to_delete))
             self.execute(
                 f"DELETE FROM history WHERE story_id IN ({placeholders})",
@@ -989,6 +990,10 @@ class Database:
             )
             self.execute(
                 f"DELETE FROM read_later WHERE story_id IN ({placeholders})",
+                all_ids_to_delete,
+            )
+            self.execute(
+                f"DELETE FROM dismissed WHERE story_id IN ({placeholders})",
                 all_ids_to_delete,
             )
 
