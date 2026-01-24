@@ -605,7 +605,9 @@ class Database:
                 else:
                     # For oldest first: get stories newer than cursor
                     query += " AND (time > ? OR (time = ? AND id > ?))"
-                params.extend([current_cursor_time, current_cursor_time, current_cursor_id])
+                params.extend(
+                    [current_cursor_time, current_cursor_time, current_cursor_id]
+                )
 
             # Order and limit
             if sort == "newest":
@@ -626,7 +628,9 @@ class Database:
 
                 # Skip blocked words in title
                 title_lower = story["title"].lower()
-                if not include_blocked and any(bw in title_lower for bw in blocked_words):
+                if not include_blocked and any(
+                    bw in title_lower for bw in blocked_words
+                ):
                     continue
 
                 # Deduplication: keep first occurrence (by sort order)
@@ -670,7 +674,11 @@ class Database:
         # has_more is true if we have more stories than limit OR there's more in DB
         has_more = len(stories) > limit or has_more_in_db
 
-        return {"stories": result_stories, "has_more": has_more, "next_cursor": next_cursor}
+        return {
+            "stories": result_stories,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+        }
 
     def update_content(
         self,
@@ -1070,7 +1078,9 @@ class Database:
                     query += " AND (s.time < ? OR (s.time = ? AND s.id < ?))"
                 else:
                     query += " AND (s.time > ? OR (s.time = ? AND s.id > ?))"
-                params.extend([current_cursor_time, current_cursor_time, current_cursor_id])
+                params.extend(
+                    [current_cursor_time, current_cursor_time, current_cursor_id]
+                )
 
             if sort == "newest":
                 query += " ORDER BY s.time DESC, s.id DESC"
@@ -1122,7 +1132,11 @@ class Database:
         result_stories = stories[:limit]
         has_more = len(stories) > limit or has_more_in_db
 
-        return {"stories": result_stories, "has_more": has_more, "next_cursor": next_cursor}
+        return {
+            "stories": result_stories,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+        }
 
     # --- Dismissed ---
 
@@ -2914,11 +2928,18 @@ async def remove_demerit_domain(domain: str = Query(...)):
 
 @app.get("/api/readlater")
 async def get_read_later(
-    dismissed_only: bool = False, limit: int = 50, cursor: str = None, sort: str = "newest"
+    dismissed_only: bool = False,
+    limit: int = 50,
+    cursor: str = None,
+    sort: str = "newest",
 ):
     cursor_time, cursor_id = parse_cursor(cursor)
     return db.get_read_later(
-        dismissed_only, limit=limit, cursor_time=cursor_time, cursor_id=cursor_id, sort=sort
+        dismissed_only,
+        limit=limit,
+        cursor_time=cursor_time,
+        cursor_id=cursor_id,
+        sort=sort,
     )
 
 
