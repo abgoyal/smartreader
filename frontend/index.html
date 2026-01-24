@@ -159,10 +159,6 @@
                     <div id="usage-stats">Loading...</div>
                 </div>
 
-                <div class="settings-section" style="margin-top: 20px;">
-                    <h3>Actions</h3>
-                    <button onclick="clearDismissed()">Clear all dismissed stories</button>
-                </div>
             </section>
         </main>
     </div>
@@ -186,8 +182,8 @@
             <div class="sheet-section">
                 <h3>Filters</h3>
                 <div class="sheet-filters">
-                    <label><input type="checkbox" id="mobile-show-dismissed" onchange="syncFilter('show-dismissed', this.checked)"> Show dismissed</label>
-                    <label><input type="checkbox" id="mobile-show-blocked" onchange="syncFilter('show-blocked', this.checked)"> Show blocked</label>
+                    <label><input type="checkbox" id="mobile-show-dismissed" onchange="syncFilter('show-dismissed', this.checked)"> Dismissed</label>
+                    <label><input type="checkbox" id="mobile-show-blocked" onchange="syncFilter('show-blocked', this.checked)"> Blocked</label>
                     <label><input type="checkbox" id="mobile-front-page-only" onchange="syncFilter('front-page-only', this.checked)"> Front page only</label>
                     <label><input type="checkbox" id="mobile-sort-oldest" onchange="syncFilter('sort-oldest', this.checked)" checked> Oldest first</label>
                 </div>
@@ -206,16 +202,6 @@
             <div class="sheet-section">
                 <button onclick="fetchNewStories(); toggleBottomSheet();" style="width: 100%; padding: 12px;">Refresh Stories</button>
             </div>
-        </div>
-    </div>
-
-    <!-- Content Modal -->
-    <div id="content-modal" class="modal">
-        <div class="modal-content">
-            <button class="modal-close" onclick="closeModal()">&times;</button>
-            <h2 id="modal-title"></h2>
-            <div id="modal-meta"></div>
-            <div id="modal-body"></div>
         </div>
     </div>
 

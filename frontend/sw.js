@@ -1,5 +1,7 @@
 // Service Worker for HN New PWA
-const CACHE_NAME = 'hn-new-v1';
+// IMPORTANT: Bump version on each deployment to bust cache
+const CACHE_VERSION = '2';
+const CACHE_NAME = `hn-new-v${CACHE_VERSION}`;
 const STATIC_ASSETS = [
     '/',
     '/static/style.css',

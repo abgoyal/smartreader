@@ -25,6 +25,22 @@ const dom = {
     contentStatus: null,
     toast: null,
     escapeDiv: null, // Cached div for escapeHtml
+    // Filter checkboxes
+    showDismissed: null,
+    showBlocked: null,
+    frontPageOnly: null,
+    sortOldest: null,
+    // Other frequently accessed elements
+    readlaterEmpty: null,
+    shortcutsHelp: null,
+    activityStats: null,
+    // Mobile elements
+    mobileStoryCount: null,
+    mobileContentStatus: null,
+    mobileActivityStats: null,
+    // Other
+    filterStatus: null,
+    cfStatsValue: null,
     init() {
         this.storyList = document.getElementById('story-list');
         this.readlaterList = document.getElementById('readlater-list');
@@ -32,6 +48,22 @@ const dom = {
         this.contentStatus = document.getElementById('content-status');
         this.toast = document.getElementById('toast');
         this.escapeDiv = document.createElement('div');
+        // Filter checkboxes
+        this.showDismissed = document.getElementById('show-dismissed');
+        this.showBlocked = document.getElementById('show-blocked');
+        this.frontPageOnly = document.getElementById('front-page-only');
+        this.sortOldest = document.getElementById('sort-oldest');
+        // Other elements
+        this.readlaterEmpty = document.getElementById('readlater-empty');
+        this.shortcutsHelp = document.getElementById('shortcuts-help');
+        this.activityStats = document.getElementById('activity-stats');
+        // Mobile elements
+        this.mobileStoryCount = document.getElementById('mobile-story-count');
+        this.mobileContentStatus = document.getElementById('mobile-content-status');
+        this.mobileActivityStats = document.getElementById('mobile-activity-stats');
+        // Other
+        this.filterStatus = document.getElementById('filter-status');
+        this.cfStatsValue = document.getElementById('cf-stats-value');
     }
 };
 
@@ -231,6 +263,8 @@ const batcher = {
 const activityStats = {
     STORAGE_KEY: 'hn_activity_stats',
     MAX_AGE_MS: 7 * 24 * 60 * 60 * 1000, // 7 days
+    PRUNE_INTERVAL: 10, // Prune every N logs
+    _logCount: 0,
 
     _load() {
         try {
@@ -247,10 +281,16 @@ const activityStats = {
     log(action) {
         const events = this._load();
         events.push({ action, ts: Date.now() });
-        // Prune old events
-        const cutoff = Date.now() - this.MAX_AGE_MS;
-        const pruned = events.filter(e => e.ts > cutoff);
-        this._save(pruned);
+        this._logCount++;
+        // Prune old events periodically (not on every log)
+        if (this._logCount >= this.PRUNE_INTERVAL) {
+            this._logCount = 0;
+            const cutoff = Date.now() - this.MAX_AGE_MS;
+            const pruned = events.filter(e => e.ts > cutoff);
+            this._save(pruned);
+        } else {
+            this._save(events);
+        }
     },
 
     getCounts(action, sinceMs) {
@@ -330,8 +370,9 @@ const api = {
 // Story Rendering
 // =============================================================================
 
-// Page render time (for consistent relative timestamps)
-const pageRenderTime = Date.now();
+// Page render time (for consistent relative timestamps within a session)
+// Refreshed when tab becomes visible again to keep times accurate
+let pageRenderTime = Date.now();
 
 function formatTime(timestamp) {
     const date = new Date(timestamp * 1000);
@@ -343,18 +384,20 @@ function formatTime(timestamp) {
 
     const hours = Math.floor(diff / 3600);
     const days = Math.floor(hours / 24);
-    const remainingHours = hours % 24;
 
     if (days === 0) {
         return `${hours}h ago`;
     } else if (days < 7) {
-        if (remainingHours === 0) {
-            return `${days}d ago`;
-        }
-        return `${days}d ${remainingHours}h ago`;
+        return `${days}d ago`;
+    } else if (days < 30) {
+        const weeks = Math.floor(days / 7);
+        return `${weeks}w ago`;
+    } else if (days < 365) {
+        const months = Math.floor(days / 30);
+        return `${months}mo ago`;
     }
 
-    // For older than a week, show date
+    // For older than a year, show date
     return date.toLocaleDateString();
 }
 
@@ -371,12 +414,18 @@ function renderStory(story) {
     if (story.is_read_later) badges += '<span class="badge badge-readlater">Later</span>';
     if (story.content_status === 'blocked') badges += '<span class="badge badge-blocked" title="Content blocked - check manually">Blocked</span>';
 
-    // Score indicator
+    // Score indicator with tooltip explaining the breakdown
     let scoreHtml = '';
-    if (story.net_score > 0) {
-        scoreHtml = `<span class="score-indicator positive">+${story.net_score}</span>`;
-    } else if (story.net_score < 0) {
-        scoreHtml = `<span class="score-indicator negative">${story.net_score}</span>`;
+    if (story.net_score > 0 || story.net_score < 0) {
+        const parts = [];
+        if (story.domain_merit) parts.push(`domain +${story.domain_merit}`);
+        if (story.word_merit) parts.push(`words +${story.word_merit}`);
+        if (story.domain_demerit) parts.push(`domain -${story.domain_demerit}`);
+        if (story.word_demerit) parts.push(`words -${story.word_demerit}`);
+        const tooltip = parts.length > 0 ? parts.join(', ') : 'merit/demerit score';
+        const cls = story.net_score > 0 ? 'positive' : 'negative';
+        const sign = story.net_score > 0 ? '+' : '';
+        scoreHtml = `<span class="score-indicator ${cls}" title="${tooltip}">${sign}${story.net_score}</span>`;
     }
 
     // Teaser - render as markdown (use safe renderer to prevent XSS)
@@ -458,20 +507,15 @@ function renderStories(reset = true) {
         if (match) expandedIds.add(parseInt(match[1]));
     });
 
-    // Filter and sort stories
-    const frontPageOnly = document.getElementById('front-page-only').checked;
-    const sortOldest = document.getElementById('sort-oldest').checked;
+    // Filter stories (sorting is handled by backend)
+    const frontPageOnly = dom.frontPageOnly.checked;
 
     let filteredStories = stories;
     if (frontPageOnly) {
         filteredStories = stories.filter(s => s.hit_front_page);
     }
 
-    const sortedStories = [...filteredStories].sort((a, b) => {
-        return sortOldest ? a.time - b.time : b.time - a.time;
-    });
-
-    if (sortedStories.length === 0) {
+    if (filteredStories.length === 0) {
         dom.storyList.innerHTML = '<li class="empty-msg">No stories match filters</li>';
         updateStoryCount();
         selectedIndex = -1;
@@ -488,10 +532,10 @@ function renderStories(reset = true) {
 
     if (reset) {
         // Full re-render
-        dom.storyList.innerHTML = sortedStories.map(renderStory).join('');
+        dom.storyList.innerHTML = filteredStories.map(renderStory).join('');
     } else {
         // Append only new stories
-        const newStories = sortedStories.filter(s => !existingDomIds.has(s.id));
+        const newStories = filteredStories.filter(s => !existingDomIds.has(s.id));
         if (newStories.length > 0) {
             // Remove loading indicator if present
             const loadingIndicator = dom.storyList.querySelector('.loading-more');
@@ -582,8 +626,10 @@ function trimOldStories() {
 // =============================================================================
 
 async function loadStories(reset = true) {
-    const dismissedOnly = document.getElementById('show-dismissed').checked;
-    const showBlocked = document.getElementById('show-blocked').checked;
+    const dismissedOnly = dom.showDismissed.checked;
+    const showBlocked = dom.showBlocked.checked;
+    const sortOldest = dom.sortOldest.checked;
+    const sort = sortOldest ? 'oldest' : 'newest';
 
     if (reset) {
         currentOffset = 0;
@@ -594,7 +640,7 @@ async function loadStories(reset = true) {
     }
 
     try {
-        const result = await api.get(`/api/stories?dismissed_only=${dismissedOnly}&include_blocked=${showBlocked}&limit=${PAGE_SIZE}&offset=${currentOffset}`);
+        const result = await api.get(`/api/stories?dismissed_only=${dismissedOnly}&include_blocked=${showBlocked}&limit=${PAGE_SIZE}&offset=${currentOffset}&sort=${sort}`);
 
         if (reset) {
             stories = result.stories;
@@ -630,10 +676,11 @@ async function loadMoreStories() {
 }
 
 async function loadReadLater() {
-    const dismissedOnly = document.getElementById('show-dismissed').checked;
-    const frontPageOnly = document.getElementById('front-page-only').checked;
-    const sortOldest = document.getElementById('sort-oldest').checked;
-    const empty = document.getElementById('readlater-empty');
+    const dismissedOnly = dom.showDismissed.checked;
+    const frontPageOnly = dom.frontPageOnly.checked;
+    const sortOldest = dom.sortOldest.checked;
+    const sort = sortOldest ? 'oldest' : 'newest';
+    const empty = dom.readlaterEmpty;
 
     // Track current state before reload
     const selectedStoryId = getSelectedStory()?.id;
@@ -645,23 +692,22 @@ async function loadReadLater() {
 
     try {
         // Read later list is typically small, load all at once
-        const result = await api.get(`/api/readlater?dismissed_only=${dismissedOnly}&limit=500`);
+        const result = await api.get(`/api/readlater?dismissed_only=${dismissedOnly}&limit=500&sort=${sort}`);
         const items = result.stories;
 
-        // Apply same filters as All view
+        // Apply front page filter (sorting is done by backend)
         let filtered = frontPageOnly ? items.filter(s => s.hit_front_page) : items;
-        const sorted = [...filtered].sort((a, b) => sortOldest ? a.time - b.time : b.time - a.time);
 
         // Store in stories array for keyboard navigation
-        stories = sorted;
+        stories = filtered;
 
-        if (sorted.length === 0) {
+        if (filtered.length === 0) {
             dom.readlaterList.innerHTML = '';
             empty.style.display = 'block';
             selectedIndex = -1;
         } else {
             empty.style.display = 'none';
-            dom.readlaterList.innerHTML = sorted.map(renderStory).join('');
+            dom.readlaterList.innerHTML = filtered.map(renderStory).join('');
 
             // Restore expanded state for stories that still exist
             for (const storyId of expandedIds) {
@@ -783,7 +829,7 @@ async function loadUsageStats() {
 }
 
 async function updateSidebarCfStats() {
-    const el = document.getElementById('cf-stats-value');
+    const el = dom.cfStatsValue;
     if (!el) return;
 
     try {
@@ -880,7 +926,7 @@ async function toggleReadLater(storyId) {
             // Show empty state
             selectedIndex = -1;
             if (currentView === 'readlater') {
-                document.getElementById('readlater-empty').style.display = 'block';
+                dom.readlaterEmpty.style.display = 'block';
             }
         } else if (wasSelected) {
             // Reselect next story
@@ -945,7 +991,7 @@ async function dismissStory(storyId) {
         // Show empty state
         selectedIndex = -1;
         if (currentView === 'readlater') {
-            document.getElementById('readlater-empty').style.display = 'block';
+            dom.readlaterEmpty.style.display = 'block';
         }
     } else if (wasDismissingSelected) {
         // Reselect next story
@@ -973,7 +1019,7 @@ async function undismissStory(storyId) {
     // In "dismissed only" mode, undismissing should hide the story (it's no longer dismissed)
     const el = document.querySelector(`.story[data-id="${storyId}"]`);
     const wasSelected = el && el.classList.contains('selected');
-    const dismissedOnly = document.getElementById('show-dismissed').checked;
+    const dismissedOnly = dom.showDismissed.checked;
 
     // Optimistic update - hide immediately in "dismissed only" mode
     if (dismissedOnly && el) {
@@ -987,7 +1033,7 @@ async function undismissStory(storyId) {
             // Show empty state
             selectedIndex = -1;
             if (currentView === 'readlater') {
-                document.getElementById('readlater-empty').style.display = 'block';
+                dom.readlaterEmpty.style.display = 'block';
             }
         } else if (wasSelected) {
             // Reselect next story
@@ -1036,7 +1082,7 @@ async function blockDomain(domain) {
     if (visible.length === 0) {
         selectedIndex = -1;
         if (currentView === 'readlater') {
-            document.getElementById('readlater-empty').style.display = 'block';
+            dom.readlaterEmpty.style.display = 'block';
         }
     } else {
         // Reselect - blocked domain may have included selected story
@@ -1058,9 +1104,22 @@ function updateStoryCount() {
     updateMobileStatus();
 }
 
+function updateFilterStatus() {
+    if (!dom.filterStatus) return;
+    const filters = [];
+    if (dom.showDismissed.checked) filters.push('dismissed');
+    if (dom.showBlocked.checked) filters.push('blocked');
+    if (dom.frontPageOnly.checked) filters.push('front page');
+
+    const sort = dom.sortOldest.checked ? 'oldest first' : 'newest first';
+    const filterText = filters.length > 0 ? filters.join(', ') : 'all';
+
+    dom.filterStatus.textContent = `${filterText} · ${sort}`;
+}
+
 function updateActivityStats() {
     const stats = activityStats.getStats();
-    const el = document.getElementById('activity-stats');
+    const el = dom.activityStats;
     if (el) {
         el.innerHTML = `
             <div class="stat-row"><span>Dismissed:</span> <span>${stats.dismissed.hour}h / ${stats.dismissed.today}d / ${stats.dismissed.week}w</span></div>
@@ -1069,7 +1128,7 @@ function updateActivityStats() {
         `;
     }
     // Update mobile too
-    const mobileEl = document.getElementById('mobile-activity-stats');
+    const mobileEl = dom.mobileActivityStats;
     if (mobileEl) {
         mobileEl.innerHTML = el ? el.innerHTML : '';
     }
@@ -1300,16 +1359,6 @@ async function removeDemeritDomain(domain) {
     }
 }
 
-async function clearDismissed() {
-    try {
-        await api.delete('/api/dismiss');
-        showToast('Cleared all dismissed stories');
-        reloadCurrentView();
-    } catch (e) {
-        showToast('Error: ' + e.message);
-    }
-}
-
 // =============================================================================
 // Navigation
 // =============================================================================
@@ -1527,10 +1576,6 @@ function showToast(message) {
     toastTimeout = setTimeout(() => dom.toast.classList.remove('visible'), 2500);
 }
 
-function closeModal() {
-    document.getElementById('content-modal').classList.remove('visible');
-}
-
 // =============================================================================
 // Keyboard Shortcuts
 // =============================================================================
@@ -1583,11 +1628,10 @@ document.addEventListener('keydown', (e) => {
             switchView('settings');
             break;
         case '?':
-            document.getElementById('shortcuts-help').classList.toggle('hidden');
+            dom.shortcutsHelp.classList.toggle('hidden');
             break;
         case 'Escape':
-            closeModal();
-            document.getElementById('shortcuts-help').classList.add('hidden');
+            dom.shortcutsHelp.classList.add('hidden');
             break;
     }
 });
@@ -1610,9 +1654,16 @@ function reloadCurrentView() {
     }
 }
 
-document.getElementById('show-dismissed').addEventListener('change', reloadCurrentView);
-document.getElementById('show-blocked').addEventListener('change', loadStories); // Only affects All view
-document.getElementById('front-page-only').addEventListener('change', () => {
+dom.showDismissed.addEventListener('change', () => {
+    updateFilterStatus();
+    reloadCurrentView();
+});
+dom.showBlocked.addEventListener('change', () => {
+    updateFilterStatus();
+    loadStories(); // Only affects All view
+});
+dom.frontPageOnly.addEventListener('change', () => {
+    updateFilterStatus();
     // In All view, just re-render (data already loaded). In Read Later, reload.
     if (currentView === 'readlater') {
         loadReadLater();
@@ -1620,12 +1671,10 @@ document.getElementById('front-page-only').addEventListener('change', () => {
         renderStories();
     }
 });
-document.getElementById('sort-oldest').addEventListener('change', () => {
-    if (currentView === 'readlater') {
-        loadReadLater();
-    } else {
-        renderStories();
-    }
+dom.sortOldest.addEventListener('change', () => {
+    updateFilterStatus();
+    // Sort is now handled by backend, so reload data
+    reloadCurrentView();
 });
 
 // Refresh button
@@ -1749,8 +1798,8 @@ function syncFilter(id, checked) {
 }
 
 function updateMobileStatus() {
-    const mobileStoryCount = document.getElementById('mobile-story-count');
-    const mobileContentStatus = document.getElementById('mobile-content-status');
+    const mobileStoryCount = dom.mobileStoryCount;
+    const mobileContentStatus = dom.mobileContentStatus;
 
     if (mobileStoryCount && dom.storyCount) {
         mobileStoryCount.textContent = dom.storyCount.textContent;
@@ -1838,10 +1887,20 @@ batcher._restore(); // Restore any pending actions from previous session
 initTagDelegation();
 initMobileCardTap();
 initInfiniteScroll();
-loadStories();
+
+// Handle PWA shortcut URLs (e.g., /?view=readlater)
+const urlParams = new URLSearchParams(window.location.search);
+const initialView = urlParams.get('view');
+if (initialView && ['all', 'readlater', 'settings'].includes(initialView)) {
+    switchView(initialView);
+} else {
+    loadStories();
+}
+
 startStatusPolling();
 updateSidebarCfStats();
 updateActivityStats();
+updateFilterStatus();
 
 // Check initial offline state (without toast)
 if (!navigator.onLine) {
@@ -1852,11 +1911,17 @@ if (!navigator.onLine) {
 window.addEventListener('beforeunload', () => {
     stopStatusPolling();
     batcher.flush(true); // Use sendBeacon for guaranteed delivery
+    if (infiniteScrollObserver) {
+        infiniteScrollObserver.disconnect();
+    }
 });
 
 // Also flush on visibility change (tab switch/close)
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
         batcher.flush(true); // Use sendBeacon for guaranteed delivery
+    } else if (document.visibilityState === 'visible') {
+        // Refresh pageRenderTime when tab becomes visible for accurate relative times
+        pageRenderTime = Date.now();
     }
 });

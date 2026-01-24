@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -408,15 +408,25 @@ class Database:
                 if not rows:
                     break
                 for row in rows:
-                    content = decompress_content(row["content"])
-                    teaser = content[:TEASER_LENGTH].strip()
-                    if len(content) > TEASER_LENGTH:
-                        teaser += "..."
-                    self.execute(
-                        "UPDATE stories SET teaser = ? WHERE id = ?",
-                        (teaser, row["id"]),
-                    )
-                    populated += 1
+                    try:
+                        content = decompress_content(row["content"])
+                        teaser = content[:TEASER_LENGTH].strip()
+                        if len(content) > TEASER_LENGTH:
+                            teaser += "..."
+                        self.execute(
+                            "UPDATE stories SET teaser = ? WHERE id = ?",
+                            (teaser, row["id"]),
+                        )
+                        populated += 1
+                    except Exception as e:
+                        log.warning(
+                            f"Failed to generate teaser for story {row['id']}: {e}"
+                        )
+                        # Mark as processed with empty teaser to avoid infinite loop
+                        self.execute(
+                            "UPDATE stories SET teaser = '' WHERE id = ?",
+                            (row["id"],),
+                        )
                 self.commit()
             log.info(f"Populated {populated} teasers")
 
@@ -508,6 +518,7 @@ class Database:
         include_read_later: bool = False,
         limit: int = 50,
         offset: int = 0,
+        sort: str = "newest",
     ) -> dict:
         """Get stories with computed scores, filtering, and deduplication.
 
@@ -526,7 +537,7 @@ class Database:
             WITH scored AS (
                 SELECT
                     s.id, s.title, s.url, s.domain, s.by, s.time, s.score, s.descendants,
-                    s.content_status, s.teaser, s.hit_front_page, s.front_page_rank, s.text,
+                    s.content_status, s.teaser, s.hit_front_page, s.front_page_rank,
                     COALESCE(md.weight, 0) as domain_merit,
                     COALESCE(dd.weight, 0) as domain_demerit,
                     CASE WHEN rl.story_id IS NOT NULL THEN 1 ELSE 0 END as is_read_later,
@@ -554,7 +565,7 @@ class Database:
         if not include_read_later:
             query += " AND is_read_later = 0"
 
-        query += " ORDER BY time DESC"
+        query += " ORDER BY time DESC" if sort == "newest" else " ORDER BY time ASC"
 
         rows = self.fetchall(query)
         stories = []
@@ -941,7 +952,11 @@ class Database:
         self.commit()
 
     def get_read_later(
-        self, dismissed_only: bool = False, limit: int = 50, offset: int = 0
+        self,
+        dismissed_only: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+        sort: str = "newest",
     ) -> dict:
         """Get read later stories.
 
@@ -957,7 +972,7 @@ class Database:
         # Select columns with merit/demerit domain scores
         query = """
             SELECT s.id, s.title, s.url, s.domain, s.by, s.time, s.score, s.descendants,
-                s.content_status, s.teaser, s.hit_front_page, s.front_page_rank, s.text,
+                s.content_status, s.teaser, s.hit_front_page, s.front_page_rank,
                 COALESCE(md.weight, 0) as domain_merit,
                 COALESCE(dd.weight, 0) as domain_demerit,
                 1 as is_read_later,
@@ -975,7 +990,7 @@ class Database:
             query += " WHERE d.story_id IS NOT NULL"
         else:
             query += " WHERE d.story_id IS NULL"
-        query += " ORDER BY rl.created_at DESC"
+        query += " ORDER BY s.time DESC" if sort == "newest" else " ORDER BY s.time ASC"
 
         rows = self.fetchall(query)
 
@@ -2609,12 +2624,24 @@ async def get_stories(
     read_later_only: bool = False,
     limit: int = 50,
     offset: int = 0,
+    sort: str = "newest",
 ):
-    if read_later_only:
-        return db.get_read_later(dismissed_only, limit=limit, offset=offset)
-    return db.get_stories(
-        dismissed_only, include_blocked, include_read_later, limit=limit, offset=offset
-    )
+    try:
+        if read_later_only:
+            return db.get_read_later(
+                dismissed_only, limit=limit, offset=offset, sort=sort
+            )
+        return db.get_stories(
+            dismissed_only,
+            include_blocked,
+            include_read_later,
+            limit=limit,
+            offset=offset,
+            sort=sort,
+        )
+    except Exception as e:
+        log.exception(f"Error in get_stories: {e}")
+        raise
 
 
 @app.get("/api/story/{story_id}")
@@ -2770,9 +2797,9 @@ async def remove_demerit_domain(domain: str = Query(...)):
 
 @app.get("/api/readlater")
 async def get_read_later(
-    dismissed_only: bool = False, limit: int = 50, offset: int = 0
+    dismissed_only: bool = False, limit: int = 50, offset: int = 0, sort: str = "newest"
 ):
-    return db.get_read_later(dismissed_only, limit=limit, offset=offset)
+    return db.get_read_later(dismissed_only, limit=limit, offset=offset, sort=sort)
 
 
 @app.post("/api/readlater/{story_id}")
@@ -2887,8 +2914,6 @@ async def batch_requests(request: Request):
                 # Parse domain from query string
                 if "domain=" in path:
                     domain = path.split("domain=")[-1].split("&")[0]
-                    from urllib.parse import unquote
-
                     db.add_blocked_domain(unquote(domain))
 
         return {"ok": True, "processed": len(requests_list)}
