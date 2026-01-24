@@ -517,61 +517,31 @@ class Database:
         include_blocked: bool = False,
         include_read_later: bool = False,
         limit: int = 50,
-        offset: int = 0,
+        cursor_time: int = None,
+        cursor_id: int = None,
         sort: str = "newest",
     ) -> dict:
         """Get stories with computed scores, filtering, and deduplication.
+
+        Uses keyset pagination with over-fetch for efficiency. Fetches batches
+        from SQL and applies Python filters until we have enough stories.
 
         Args:
             dismissed_only: If True, show ONLY dismissed stories. If False, exclude dismissed.
             include_blocked: If True, include stories from blocked domains.
             include_read_later: If True, include stories marked for read later.
             limit: Max number of stories to return.
-            offset: Number of stories to skip (for pagination).
+            cursor_time: Timestamp of last story from previous page (for keyset pagination).
+            cursor_id: ID of last story from previous page (tiebreaker for same timestamp).
+            sort: 'newest' or 'oldest'.
 
         Returns:
-            dict with 'stories' list and 'has_more' boolean.
+            dict with 'stories' list, 'has_more' boolean, and 'next_cursor' string.
         """
-        # Select only needed columns (no content - it's fetched on demand)
-        query = """
-            WITH scored AS (
-                SELECT
-                    s.id, s.title, s.url, s.domain, s.by, s.time, s.score, s.descendants,
-                    s.content_status, s.teaser, s.hit_front_page, s.front_page_rank,
-                    COALESCE(md.weight, 0) as domain_merit,
-                    COALESCE(dd.weight, 0) as domain_demerit,
-                    CASE WHEN rl.story_id IS NOT NULL THEN 1 ELSE 0 END as is_read_later,
-                    CASE WHEN d.story_id IS NOT NULL THEN 1 ELSE 0 END as is_dismissed,
-                    CASE WHEN h.story_id IS NOT NULL THEN 1 ELSE 0 END as is_read,
-                    CASE WHEN bd.domain IS NOT NULL THEN 1 ELSE 0 END as is_domain_blocked
-                FROM stories s
-                LEFT JOIN merit_domains md ON s.domain = md.domain
-                LEFT JOIN demerit_domains dd ON s.domain = dd.domain
-                LEFT JOIN read_later rl ON s.id = rl.story_id
-                LEFT JOIN dismissed d ON s.id = d.story_id
-                LEFT JOIN history h ON s.id = h.story_id
-                LEFT JOIN blocked_domains bd ON s.domain = bd.domain
-            )
-            SELECT * FROM scored
-            WHERE 1=1
-        """
-        # Exclusive filter: show ONLY dismissed OR ONLY non-dismissed
-        if dismissed_only:
-            query += " AND is_dismissed = 1"
-        else:
-            query += " AND is_dismissed = 0"
-        if not include_blocked:
-            query += " AND is_domain_blocked = 0"
-        if not include_read_later:
-            query += " AND is_read_later = 0"
+        SQL_MULTIPLIER = 3  # Fetch 3x limit to account for filtering
+        sql_limit = limit * SQL_MULTIPLIER
 
-        query += " ORDER BY time DESC" if sort == "newest" else " ORDER BY time ASC"
-
-        rows = self.fetchall(query)
-        stories = []
-        seen_urls = set()
-
-        # Get merit/demerit words for scoring
+        # Pre-fetch filter data (only once per call)
         merit_words = {
             r["word"].lower(): r["weight"]
             for r in self.fetchall("SELECT word, weight FROM merit_words")
@@ -584,40 +554,123 @@ class Database:
             r["word"].lower() for r in self.fetchall("SELECT word FROM blocked_words")
         }
 
-        for row in rows:
-            story = dict(row)
+        stories = []
+        seen_urls = set()
+        current_cursor_time = cursor_time
+        current_cursor_id = cursor_id
+        has_more_in_db = True
 
-            # Skip blocked words in title
-            title_lower = story["title"].lower()
-            if not include_blocked and any(bw in title_lower for bw in blocked_words):
-                continue
+        # Keep fetching batches until we have enough stories or run out
+        while len(stories) < limit and has_more_in_db:
+            # Build query with keyset pagination
+            query = """
+                WITH scored AS (
+                    SELECT
+                        s.id, s.title, s.url, s.domain, s.by, s.time, s.score, s.descendants,
+                        s.content_status, s.teaser, s.hit_front_page, s.front_page_rank,
+                        COALESCE(md.weight, 0) as domain_merit,
+                        COALESCE(dd.weight, 0) as domain_demerit,
+                        CASE WHEN rl.story_id IS NOT NULL THEN 1 ELSE 0 END as is_read_later,
+                        CASE WHEN d.story_id IS NOT NULL THEN 1 ELSE 0 END as is_dismissed,
+                        CASE WHEN h.story_id IS NOT NULL THEN 1 ELSE 0 END as is_read,
+                        CASE WHEN bd.domain IS NOT NULL THEN 1 ELSE 0 END as is_domain_blocked
+                    FROM stories s
+                    LEFT JOIN merit_domains md ON s.domain = md.domain
+                    LEFT JOIN demerit_domains dd ON s.domain = dd.domain
+                    LEFT JOIN read_later rl ON s.id = rl.story_id
+                    LEFT JOIN dismissed d ON s.id = d.story_id
+                    LEFT JOIN history h ON s.id = h.story_id
+                    LEFT JOIN blocked_domains bd ON s.domain = bd.domain
+                )
+                SELECT * FROM scored
+                WHERE 1=1
+            """
+            params = []
 
-            # Deduplication: keep story with most engagement
-            url = story.get("url") or f"hn:{story['id']}"
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
+            # Exclusive filter: show ONLY dismissed OR ONLY non-dismissed
+            if dismissed_only:
+                query += " AND is_dismissed = 1"
+            else:
+                query += " AND is_dismissed = 0"
+            if not include_blocked:
+                query += " AND is_domain_blocked = 0"
+            if not include_read_later:
+                query += " AND is_read_later = 0"
 
-            # Compute word-based score
-            word_merit = sum(
-                w for word, w in merit_words.items() if word in title_lower
-            )
-            word_demerit = sum(
-                w for word, w in demerit_words.items() if word in title_lower
-            )
+            # Keyset pagination cursor
+            if current_cursor_time is not None and current_cursor_id is not None:
+                if sort == "newest":
+                    # For newest first: get stories older than cursor
+                    query += " AND (time < ? OR (time = ? AND id < ?))"
+                else:
+                    # For oldest first: get stories newer than cursor
+                    query += " AND (time > ? OR (time = ? AND id > ?))"
+                params.extend([current_cursor_time, current_cursor_time, current_cursor_id])
 
-            story["merit_score"] = story["domain_merit"] + word_merit
-            story["demerit_score"] = story["domain_demerit"] + word_demerit
-            story["net_score"] = story["merit_score"] - story["demerit_score"]
+            # Order and limit
+            if sort == "newest":
+                query += " ORDER BY time DESC, id DESC"
+            else:
+                query += " ORDER BY time ASC, id ASC"
+            query += f" LIMIT {sql_limit}"
 
-            stories.append(story)
+            rows = self.fetchall(query, tuple(params))
+            has_more_in_db = len(rows) == sql_limit
 
-        # Apply pagination after filtering/deduplication
-        total = len(stories)
-        paginated = stories[offset : offset + limit]
-        has_more = offset + limit < total
+            if not rows:
+                break
 
-        return {"stories": paginated, "has_more": has_more, "total": total}
+            # Process rows through Python filters
+            for row in rows:
+                story = dict(row)
+
+                # Skip blocked words in title
+                title_lower = story["title"].lower()
+                if not include_blocked and any(bw in title_lower for bw in blocked_words):
+                    continue
+
+                # Deduplication: keep first occurrence (by sort order)
+                url = story.get("url") or f"hn:{story['id']}"
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+
+                # Compute word-based score
+                word_merit = sum(
+                    w for word, w in merit_words.items() if word in title_lower
+                )
+                word_demerit = sum(
+                    w for word, w in demerit_words.items() if word in title_lower
+                )
+
+                story["word_merit"] = word_merit
+                story["word_demerit"] = word_demerit
+                story["merit_score"] = story["domain_merit"] + word_merit
+                story["demerit_score"] = story["domain_demerit"] + word_demerit
+                story["net_score"] = story["merit_score"] - story["demerit_score"]
+
+                stories.append(story)
+
+                if len(stories) >= limit:
+                    break
+
+            # Update cursor for next batch (if needed)
+            if rows:
+                last_row = rows[-1]
+                current_cursor_time = last_row["time"]
+                current_cursor_id = last_row["id"]
+
+        # Build next_cursor from the last story we're returning
+        next_cursor = None
+        if stories and (has_more_in_db or len(stories) >= limit):
+            last_story = stories[-1] if len(stories) <= limit else stories[limit - 1]
+            next_cursor = f"{last_story['time']}:{last_story['id']}"
+
+        result_stories = stories[:limit]
+        # has_more is true if we have more stories than limit OR there's more in DB
+        has_more = len(stories) > limit or has_more_in_db
+
+        return {"stories": result_stories, "has_more": has_more, "next_cursor": next_cursor}
 
     def update_content(
         self,
@@ -955,76 +1008,121 @@ class Database:
         self,
         dismissed_only: bool = False,
         limit: int = 50,
-        offset: int = 0,
+        cursor_time: int = None,
+        cursor_id: int = None,
         sort: str = "newest",
     ) -> dict:
-        """Get read later stories.
+        """Get read later stories with keyset pagination.
 
         Args:
             dismissed_only: If True, show ONLY dismissed read later stories.
                            If False, exclude dismissed ones.
             limit: Max number of stories to return.
-            offset: Number of stories to skip (for pagination).
+            cursor_time: Timestamp of last story from previous page.
+            cursor_id: ID of last story from previous page (tiebreaker).
+            sort: 'newest' or 'oldest'.
 
         Returns:
-            dict with 'stories' list and 'has_more' boolean.
+            dict with 'stories' list, 'has_more' boolean, and 'next_cursor' string.
         """
-        # Select columns with merit/demerit domain scores
-        query = """
-            SELECT s.id, s.title, s.url, s.domain, s.by, s.time, s.score, s.descendants,
-                s.content_status, s.teaser, s.hit_front_page, s.front_page_rank,
-                COALESCE(md.weight, 0) as domain_merit,
-                COALESCE(dd.weight, 0) as domain_demerit,
-                1 as is_read_later,
-                CASE WHEN d.story_id IS NOT NULL THEN 1 ELSE 0 END as is_dismissed,
-                CASE WHEN h.story_id IS NOT NULL THEN 1 ELSE 0 END as is_read
-            FROM stories s
-            JOIN read_later rl ON s.id = rl.story_id
-            LEFT JOIN dismissed d ON s.id = d.story_id
-            LEFT JOIN history h ON s.id = h.story_id
-            LEFT JOIN merit_domains md ON s.domain = md.domain
-            LEFT JOIN demerit_domains dd ON s.domain = dd.domain
-        """
-        # Exclusive filter: show ONLY dismissed OR ONLY non-dismissed
-        if dismissed_only:
-            query += " WHERE d.story_id IS NOT NULL"
-        else:
-            query += " WHERE d.story_id IS NULL"
-        query += " ORDER BY s.time DESC" if sort == "newest" else " ORDER BY s.time ASC"
+        # Read later is typically small, but use consistent pagination approach
+        SQL_MULTIPLIER = 3
+        sql_limit = limit * SQL_MULTIPLIER
 
-        rows = self.fetchall(query)
-
-        # Get merit/demerit words for scoring
+        # Pre-fetch merit/demerit words
         merit_words = {w["word"].lower(): w["weight"] for w in self.get_merit_words()}
         demerit_words = {
             w["word"].lower(): w["weight"] for w in self.get_demerit_words()
         }
 
         stories = []
-        for row in rows:
-            story = dict(row)
-            title_lower = story["title"].lower()
+        current_cursor_time = cursor_time
+        current_cursor_id = cursor_id
+        has_more_in_db = True
 
-            # Compute word-based merit/demerit scores
-            word_merit = sum(
-                w for word, w in merit_words.items() if word in title_lower
-            )
-            word_demerit = sum(
-                w for word, w in demerit_words.items() if word in title_lower
-            )
+        while len(stories) < limit and has_more_in_db:
+            query = """
+                SELECT s.id, s.title, s.url, s.domain, s.by, s.time, s.score, s.descendants,
+                    s.content_status, s.teaser, s.hit_front_page, s.front_page_rank,
+                    COALESCE(md.weight, 0) as domain_merit,
+                    COALESCE(dd.weight, 0) as domain_demerit,
+                    1 as is_read_later,
+                    CASE WHEN d.story_id IS NOT NULL THEN 1 ELSE 0 END as is_dismissed,
+                    CASE WHEN h.story_id IS NOT NULL THEN 1 ELSE 0 END as is_read
+                FROM stories s
+                JOIN read_later rl ON s.id = rl.story_id
+                LEFT JOIN dismissed d ON s.id = d.story_id
+                LEFT JOIN history h ON s.id = h.story_id
+                LEFT JOIN merit_domains md ON s.domain = md.domain
+                LEFT JOIN demerit_domains dd ON s.domain = dd.domain
+            """
+            params = []
 
-            story["merit_score"] = story["domain_merit"] + word_merit
-            story["demerit_score"] = story["domain_demerit"] + word_demerit
-            story["net_score"] = story["merit_score"] - story["demerit_score"]
+            # Exclusive filter: show ONLY dismissed OR ONLY non-dismissed
+            if dismissed_only:
+                query += " WHERE d.story_id IS NOT NULL"
+            else:
+                query += " WHERE d.story_id IS NULL"
 
-            stories.append(story)
+            # Keyset pagination cursor
+            if current_cursor_time is not None and current_cursor_id is not None:
+                if sort == "newest":
+                    query += " AND (s.time < ? OR (s.time = ? AND s.id < ?))"
+                else:
+                    query += " AND (s.time > ? OR (s.time = ? AND s.id > ?))"
+                params.extend([current_cursor_time, current_cursor_time, current_cursor_id])
 
-        # Apply pagination
-        total = len(stories)
-        paginated = stories[offset : offset + limit]
-        has_more = offset + limit < total
+            if sort == "newest":
+                query += " ORDER BY s.time DESC, s.id DESC"
+            else:
+                query += " ORDER BY s.time ASC, s.id ASC"
+            query += f" LIMIT {sql_limit}"
 
-        return {"stories": paginated, "has_more": has_more, "total": total}
+            rows = self.fetchall(query, tuple(params))
+            has_more_in_db = len(rows) == sql_limit
+
+            if not rows:
+                break
+
+            for row in rows:
+                story = dict(row)
+                title_lower = story["title"].lower()
+
+                # Compute word-based merit/demerit scores
+                word_merit = sum(
+                    w for word, w in merit_words.items() if word in title_lower
+                )
+                word_demerit = sum(
+                    w for word, w in demerit_words.items() if word in title_lower
+                )
+
+                story["word_merit"] = word_merit
+                story["word_demerit"] = word_demerit
+                story["merit_score"] = story["domain_merit"] + word_merit
+                story["demerit_score"] = story["domain_demerit"] + word_demerit
+                story["net_score"] = story["merit_score"] - story["demerit_score"]
+
+                stories.append(story)
+
+                if len(stories) >= limit:
+                    break
+
+            # Update cursor for next batch
+            if rows:
+                last_row = rows[-1]
+                current_cursor_time = last_row["time"]
+                current_cursor_id = last_row["id"]
+
+        # Build next_cursor from the last story we're returning
+        next_cursor = None
+        if stories and (has_more_in_db or len(stories) >= limit):
+            last_story = stories[-1] if len(stories) <= limit else stories[limit - 1]
+            next_cursor = f"{last_story['time']}:{last_story['id']}"
+
+        result_stories = stories[:limit]
+        has_more = len(stories) > limit or has_more_in_db
+
+        return {"stories": result_stories, "has_more": has_more, "next_cursor": next_cursor}
 
     # --- Dismissed ---
 
@@ -2616,6 +2714,19 @@ async def index(request: Request):
 # --- API Routes ---
 
 
+def parse_cursor(cursor: str) -> tuple[int, int] | tuple[None, None]:
+    """Parse cursor string 'time:id' into (time, id) tuple."""
+    if not cursor:
+        return None, None
+    try:
+        parts = cursor.split(":")
+        if len(parts) == 2:
+            return int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        pass
+    return None, None
+
+
 @app.get("/api/stories")
 async def get_stories(
     dismissed_only: bool = False,
@@ -2623,20 +2734,26 @@ async def get_stories(
     include_read_later: bool = False,
     read_later_only: bool = False,
     limit: int = 50,
-    offset: int = 0,
+    cursor: str = None,
     sort: str = "newest",
 ):
     try:
+        cursor_time, cursor_id = parse_cursor(cursor)
         if read_later_only:
             return db.get_read_later(
-                dismissed_only, limit=limit, offset=offset, sort=sort
+                dismissed_only,
+                limit=limit,
+                cursor_time=cursor_time,
+                cursor_id=cursor_id,
+                sort=sort,
             )
         return db.get_stories(
             dismissed_only,
             include_blocked,
             include_read_later,
             limit=limit,
-            offset=offset,
+            cursor_time=cursor_time,
+            cursor_id=cursor_id,
             sort=sort,
         )
     except Exception as e:
@@ -2797,9 +2914,12 @@ async def remove_demerit_domain(domain: str = Query(...)):
 
 @app.get("/api/readlater")
 async def get_read_later(
-    dismissed_only: bool = False, limit: int = 50, offset: int = 0, sort: str = "newest"
+    dismissed_only: bool = False, limit: int = 50, cursor: str = None, sort: str = "newest"
 ):
-    return db.get_read_later(dismissed_only, limit=limit, offset=offset, sort=sort)
+    cursor_time, cursor_id = parse_cursor(cursor)
+    return db.get_read_later(
+        dismissed_only, limit=limit, cursor_time=cursor_time, cursor_id=cursor_id, sort=sort
+    )
 
 
 @app.post("/api/readlater/{story_id}")

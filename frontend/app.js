@@ -9,7 +9,7 @@ let statusPollInterval = null;
 
 // Pagination state
 let hasMore = false;
-let currentOffset = 0;
+let nextCursor = null;  // Cursor for keyset pagination (format: "time:id")
 let isLoadingMore = false;
 const PAGE_SIZE = 50;
 const MAX_DOM_ELEMENTS = 200; // Remove old elements when exceeding this
@@ -632,7 +632,7 @@ async function loadStories(reset = true) {
     const sort = sortOldest ? 'oldest' : 'newest';
 
     if (reset) {
-        currentOffset = 0;
+        nextCursor = null;
         stories = [];
         hasMore = false; // Reset until we get fresh data from API
         // Show loading state only on initial load
@@ -640,7 +640,11 @@ async function loadStories(reset = true) {
     }
 
     try {
-        const result = await api.get(`/api/stories?dismissed_only=${dismissedOnly}&include_blocked=${showBlocked}&limit=${PAGE_SIZE}&offset=${currentOffset}&sort=${sort}`);
+        let url = `/api/stories?dismissed_only=${dismissedOnly}&include_blocked=${showBlocked}&limit=${PAGE_SIZE}&sort=${sort}`;
+        if (nextCursor) {
+            url += `&cursor=${encodeURIComponent(nextCursor)}`;
+        }
+        const result = await api.get(url);
 
         if (reset) {
             stories = result.stories;
@@ -652,7 +656,7 @@ async function loadStories(reset = true) {
         }
 
         hasMore = result.has_more;
-        currentOffset = stories.length;
+        nextCursor = result.next_cursor;
 
         // renderStories() handles state preservation (selection, expanded content, scroll)
         renderStories(reset);
