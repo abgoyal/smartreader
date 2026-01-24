@@ -1658,29 +1658,6 @@ function reloadCurrentView() {
     }
 }
 
-dom.showDismissed.addEventListener('change', () => {
-    updateFilterStatus();
-    reloadCurrentView();
-});
-dom.showBlocked.addEventListener('change', () => {
-    updateFilterStatus();
-    loadStories(); // Only affects All view
-});
-dom.frontPageOnly.addEventListener('change', () => {
-    updateFilterStatus();
-    // In All view, just re-render (data already loaded). In Read Later, reload.
-    if (currentView === 'readlater') {
-        loadReadLater();
-    } else {
-        renderStories();
-    }
-});
-dom.sortOldest.addEventListener('change', () => {
-    updateFilterStatus();
-    // Sort is now handled by backend, so reload data
-    reloadCurrentView();
-});
-
 // Refresh button
 document.getElementById('btn-refresh').addEventListener('click', fetchNewStories);
 
@@ -1887,6 +1864,31 @@ function observeLoadingIndicator() {
 
 initTheme();
 dom.init();
+
+// Filter checkbox event listeners (must be after dom.init())
+dom.showDismissed.addEventListener('change', () => {
+    updateFilterStatus();
+    reloadCurrentView();
+});
+dom.showBlocked.addEventListener('change', () => {
+    updateFilterStatus();
+    loadStories(); // Only affects All view
+});
+dom.frontPageOnly.addEventListener('change', () => {
+    updateFilterStatus();
+    // In All view, just re-render (data already loaded). In Read Later, reload.
+    if (currentView === 'readlater') {
+        loadReadLater();
+    } else {
+        renderStories();
+    }
+});
+dom.sortOldest.addEventListener('change', () => {
+    updateFilterStatus();
+    // Sort is now handled by backend, so reload data
+    reloadCurrentView();
+});
+
 batcher._restore(); // Restore any pending actions from previous session
 initTagDelegation();
 initMobileCardTap();
